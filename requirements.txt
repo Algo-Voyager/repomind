@@ -1,0 +1,7 @@
+anthropic
+chromadb
+ollama
+PyGithub
+streamlit
+python-dotenv
+pandas

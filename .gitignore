@@ -1,0 +1,6 @@
+.env
+chroma_db/
+__pycache__/
+agent_logs.jsonl
+eval_results.jsonl
+benchmark_results.json
