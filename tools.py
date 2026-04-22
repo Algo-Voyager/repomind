@@ -170,74 +170,65 @@ def get_recent_commits(collection_name: str, n: int = 5) -> str:
 
 TOOL_SCHEMAS = [
     {
-        "type": "function",
-        "function": {
-            "name": "vector_search",
-            "description": (
-                "Search the indexed codebase semantically. Use this FIRST "
-                "for any question about code or docs."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query",
-                    },
-                    "filter_type": {
-                        "type": "string",
-                        "enum": ["function", "class", "doc", "code"],
-                        "description": "Optional filter on chunk type",
-                    },
-                    "n_results": {
-                        "type": "integer",
-                        "description": "Number of results to return",
-                        "default": 5,
-                    },
+        "name": "vector_search",
+        "description": (
+            "Search the indexed codebase semantically. Use this FIRST "
+            "for any question about code or docs."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query",
                 },
-                "required": ["query"],
+                "filter_type": {
+                    "type": "string",
+                    "enum": ["function", "class", "doc", "code"],
+                    "description": "Optional filter on chunk type",
+                },
+                "n_results": {
+                    "type": "integer",
+                    "description": "Number of results to return",
+                    "default": 5,
+                },
             },
+            "required": ["query"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "get_file",
-            "description": (
-                "Fetch the raw content of a file from the GitHub repo. "
-                "Use when you need the full file, not just a chunk."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Repo-relative path, e.g. 'src/main.py'",
-                    },
+        "name": "get_file",
+        "description": (
+            "Fetch the raw content of a file from the GitHub repo. "
+            "Use when you need the full file, not just a chunk."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Repo-relative path, e.g. 'src/main.py'",
                 },
-                "required": ["file_path"],
             },
+            "required": ["file_path"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "get_recent_commits",
-            "description": (
-                "Fetch the most recent commits from the GitHub repo. "
-                "Use for questions about recent changes or history."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {
-                        "type": "integer",
-                        "description": "Number of commits to fetch",
-                        "default": 5,
-                    },
+        "name": "get_recent_commits",
+        "description": (
+            "Fetch the most recent commits from the GitHub repo. "
+            "Use for questions about recent changes or history."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "n": {
+                    "type": "integer",
+                    "description": "Number of commits to fetch",
+                    "default": 5,
                 },
-                "required": [],
             },
+            "required": [],
         },
     },
 ]
