@@ -15,7 +15,7 @@ Setup assumes a local venv and a running Ollama daemon with `nomic-embed-text` p
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ollama pull nomic-embed-text
-cp .env.example .env   # fill in ANTHROPIC_API_KEY and GITHUB_TOKEN
+cp .env.example .env   # fill in VLLM_BASE_URL, VLLM_API_KEY, VLLM_MODEL, GITHUB_TOKEN
 
 # Build the local vector index (writes to ./chroma_db)
 python ingest.py
@@ -30,20 +30,21 @@ No test runner, linter, or formatter is configured yet. If you add one, update t
 
 The system is a from-scratch RAG agent — **no LangChain, no LlamaIndex**. Keep that constraint when adding features; do not introduce those frameworks.
 
-Data flow: `ingest.py` pulls a GitHub repo via PyGithub, embeds chunks with Ollama (`nomic-embed-text`), and persists them to ChromaDB at `./chroma_db`. At query time, `app.py` (Streamlit) calls into `agent.py`, which runs a Claude tool-use loop. The agent reaches the index through tools defined in `tools.py` — the retrieval path is tool-call mediated, not a direct RAG pipeline, so prompts and tool schemas in `prompts.py` / `tools.py` are the primary surface for behavior changes.
+Data flow: `ingest.py` pulls a GitHub repo via PyGithub, embeds chunks with Ollama (`nomic-embed-text`), and persists them to ChromaDB at `./chroma_db`. At query time, `app.py` (Streamlit) calls into `agent.py`, which runs an OpenAI-compatible tool-use loop against a self-hosted vLLM server on Modal (see `deploy/vllm_modal.py`). The agent reaches the index through tools defined in `tools.py` — the retrieval path is tool-call mediated, not a direct RAG pipeline, so prompts and tool schemas in `prompts.py` / `tools.py` are the primary surface for behavior changes.
 
 Module responsibilities (per README):
 - `ingest.py` — repo fetch + chunk + embed + write to Chroma. Runs standalone.
-- `agent.py` — Claude conversation loop with tool dispatch.
+- `agent.py` — OpenAI-SDK conversation loop (pointed at `VLLM_BASE_URL`) with tool dispatch.
 - `tools.py` — tool definitions (schemas + implementations) the agent invokes; this is where vector search, file reads, etc. live.
 - `prompts.py` — system and task prompts.
 - `logger.py` — structured JSONL logging to `agent_logs.jsonl` (gitignored).
 - `app.py` — Streamlit front end wrapping the agent.
+- `deploy/vllm_modal.py` — Modal app that boots vLLM's OpenAI-compatible server on a GPU. Deploy with `modal serve deploy/vllm_modal.py` (dev) or `modal deploy deploy/vllm_modal.py` (persistent).
 - `eval/` — offline evaluation harness: `test_queries.py` (benchmark set), `metrics.py` (scoring), `compare.py` (run/config comparison). Writes `eval_results.jsonl` / `benchmark_results.json` (both gitignored).
 
 ## Model and dependencies
 
-- LLM: `claude-opus-4-7` via the `anthropic` SDK. If updating models, check the Anthropic docs for the current identifier.
+- LLM: self-hosted on Modal via vLLM, exposed as an OpenAI-compatible endpoint. Default model `Qwen/Qwen2.5-7B-Instruct` — change `MODEL_NAME` in `deploy/vllm_modal.py` to swap. The Anthropic SDK is **not** used; client code uses `openai.OpenAI(base_url=VLLM_BASE_URL, api_key=VLLM_API_KEY)`.
 - Embeddings: Ollama `nomic-embed-text`, accessed via the `ollama` Python client — embeddings are local, so the Ollama daemon must be running during ingest and query.
 - Vector store: ChromaDB persistent client rooted at `./chroma_db` (gitignored). Treat the directory as disposable; rebuild via `python ingest.py`.
 

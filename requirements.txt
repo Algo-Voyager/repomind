@@ -1,4 +1,4 @@
-anthropic
+openai
 chromadb
 ollama
 PyGithub

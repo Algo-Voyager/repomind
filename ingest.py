@@ -18,7 +18,7 @@ from typing import Iterable
 import chromadb
 import ollama
 from dotenv import load_dotenv
-from github import Github, GithubException, RateLimitExceededException
+from github import Auth, Github, GithubException, RateLimitExceededException
 from github.ContentFile import ContentFile
 from github.Repository import Repository
 
@@ -255,11 +255,32 @@ def main() -> int:
         print("GITHUB_TOKEN is not set. Add it to .env.", file=sys.stderr)
         return 2
 
-    gh = Github(token)
+    gh = Github(auth=Auth.Token(token))
     try:
         repo = gh.get_repo(args.repo)
     except GithubException as e:
-        print(f"Failed to open repo {args.repo!r}: {e}", file=sys.stderr)
+        if e.status == 404:
+            print(
+                f"Repo {args.repo!r} returned 404. Common causes:\n"
+                f"  1. Typo in the repo name (case-sensitive).\n"
+                f"  2. Repo is private and your GITHUB_TOKEN doesn't grant access "
+                f"to it. Fine-grained PATs require you to explicitly list the "
+                f"repos they can read — check https://github.com/settings/"
+                f"personal-access-tokens and add this repo (or use a classic "
+                f"PAT with the 'repo' scope).\n"
+                f"  3. Repo was deleted or you're on the wrong owner/org.\n"
+                f"Verify with: curl -H 'Authorization: Bearer $GITHUB_TOKEN' "
+                f"https://api.github.com/repos/{args.repo}",
+                file=sys.stderr,
+            )
+        elif e.status == 401:
+            print(
+                "GITHUB_TOKEN was rejected (401). Check it hasn't expired, "
+                "and that the token string in .env is complete.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Failed to open repo {args.repo!r}: {e}", file=sys.stderr)
         return 1
 
     client = chromadb.PersistentClient(path="./chroma_db")
