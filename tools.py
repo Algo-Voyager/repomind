@@ -180,16 +180,16 @@ TOOL_SCHEMAS = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query",
+                    "description": "Search query — use technical keywords",
                 },
                 "filter_type": {
                     "type": "string",
                     "enum": ["function", "class", "doc", "code"],
-                    "description": "Optional filter on chunk type",
+                    "description": "Optional: filter to a specific chunk type",
                 },
                 "n_results": {
                     "type": "integer",
-                    "description": "Number of results to return",
+                    "description": "Number of results",
                     "default": 5,
                 },
             },
@@ -198,16 +198,13 @@ TOOL_SCHEMAS = [
     },
     {
         "name": "get_file",
-        "description": (
-            "Fetch the raw content of a file from the GitHub repo. "
-            "Use when you need the full file, not just a chunk."
-        ),
+        "description": "Fetch the full contents of a specific file from the repo.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Repo-relative path, e.g. 'src/main.py'",
+                    "description": "Path to the file, e.g. 'src/auth/service.py'",
                 },
             },
             "required": ["file_path"],
@@ -215,16 +212,13 @@ TOOL_SCHEMAS = [
     },
     {
         "name": "get_recent_commits",
-        "description": (
-            "Fetch the most recent commits from the GitHub repo. "
-            "Use for questions about recent changes or history."
-        ),
+        "description": "Get the last N commits from the repo.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "n": {
                     "type": "integer",
-                    "description": "Number of commits to fetch",
+                    "description": "Number of commits",
                     "default": 5,
                 },
             },
