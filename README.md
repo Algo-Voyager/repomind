@@ -56,7 +56,15 @@ Repomind talks to any OpenAI-compatible endpoint. Start a local vLLM server (or 
 vllm serve Qwen/Qwen2.5-7B-Instruct --port 8001
 ```
 
-Or deploy to Modal using `deploy/vllm_modal.py` (vestigial reference — update to match your model).
+Or deploy to Modal (stays up, scales to zero when idle):
+
+```bash
+.venv/bin/modal deploy deploy/qwen_modal.py
+# → sets VLLM_BASE_URL to the printed URL in .env
+
+# To stop and clean up all Modal resources:
+bash cleanup_modal.sh
+```
 
 ### 6. Configure environment variables
 
@@ -118,6 +126,41 @@ python agent.py <owner>_<repo>_<mode> "How does error handling work?"
 python tools.py <owner>_<repo>_<mode>
 ```
 
+## PyCharm Run Configurations
+
+The app has two Python processes. Create one debug configuration for each.
+
+**Config 1 — FastAPI server (Inngest functions)**
+
+Run → Edit Configurations → + → Python
+
+| Field | Value |
+|-------|-------|
+| Name | `repomind-server` |
+| Module name | `uvicorn` |
+| Parameters | `server:app --port 8000` |
+| Working dir | `/path/to/repomind` |
+| Env vars | load from `.env` (use the "EnvFile" plugin or paste manually) |
+
+> No `--reload` — reload spawns a child process the debugger loses track of.
+
+**Config 2 — Streamlit UI (agent + tools)**
+
+Run → Edit Configurations → + → Python
+
+| Field | Value |
+|-------|-------|
+| Name | `repomind-streamlit` |
+| Module name | `streamlit` |
+| Parameters | `run app.py` |
+| Working dir | `/path/to/repomind` |
+
+Start the Inngest Dev Server separately in a terminal (it's Node.js, PyCharm can't debug it):
+
+```bash
+npx inngest-cli@latest dev -u http://localhost:8000/api/inngest
+```
+
 ## Inngest monitoring
 
 Three Inngest functions run in the background:
@@ -170,8 +213,9 @@ repomind/
 ├── prompts.py             # SYSTEM_PROMPT + QUERY_REWRITE_PROMPT
 ├── logger.py              # Structured JSONL logging to agent_logs.jsonl
 ├── app.py                 # Streamlit UI (Chat / Logs / Benchmarks)
+├── cleanup_modal.sh       # Stop Modal app + delete cached volumes
 ├── deploy/
-│   └── vllm_modal.py      # Reference Modal deployment for vLLM
+│   └── qwen_modal.py      # Modal deployment: Qwen2.5-7B via vLLM (OpenAI-compatible)
 ├── eval/
 │   ├── test_queries.py    # Correctness test suite (keyword match / anti-match)
 │   ├── compare.py         # AST vs naive benchmark (LLM as judge)

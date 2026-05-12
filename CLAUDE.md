@@ -54,7 +54,7 @@ Module responsibilities:
 - `inngest_setup.py` — shared Inngest client singleton (imported by `server.py` and `agent.py`).
 - `server.py` — FastAPI + Inngest server. Hosts three Inngest functions: `repomind/ingest_repo` (2 steps), `repomind/run_agent` (1 step), `repomind/agent_completed` (post-run metrics). REST: `POST /api/ingest`, `POST /api/query`, `GET /api/result/{session_id}`.
 - `app.py` — Streamlit front end. Ingestion triggers `POST /api/ingest` on the server (Inngest background job). Chat runs agent synchronously for immediate UX.
-- `deploy/vllm_modal.py` — **vestigial.** Kept for reference only.
+- `deploy/qwen_modal.py` — Modal deployment for Qwen2.5-7B via vLLM. Serves an OpenAI-compatible `/v1/chat/completions` endpoint. `bash cleanup_modal.sh` stops the app and deletes cached volumes.
 - `eval/` — offline evaluation harness: `test_queries.py` (benchmark set), `metrics.py` (scoring), `compare.py` (run/config comparison). Writes `eval_results.jsonl` / `benchmark_results.json` (both gitignored).
 
 ## Model and dependencies
