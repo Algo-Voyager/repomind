@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import chromadb
@@ -18,7 +19,6 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-from agent import run_agent
 from eval.metrics import compute_aggregate_metrics
 from logger import get_recent_logs, get_session_logs
 
@@ -62,7 +62,7 @@ with st.sidebar:
             except httpx.TimeoutException:
                 st.error(
                     "Server did not respond in time. "
-                    "Check that `uvicorn server:app --port 8000` is running."
+                    "Check that the repomind server is running."
                 )
             except httpx.HTTPStatusError as e:
                 st.error(f"Ingest failed ({e.response.status_code}): {e.response.text[:200]}")
@@ -100,10 +100,14 @@ with tab_chat:
     if not selected:
         st.info("Ingest a repo first")
     else:
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
+        if "chat_histories" not in st.session_state:
+            st.session_state.chat_histories = {}
+        if selected not in st.session_state.chat_histories:
+            st.session_state.chat_histories[selected] = []
 
-        for msg in st.session_state.messages:
+        messages = st.session_state.chat_histories[selected]
+
+        for msg in messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
                 if msg.get("steps"):
@@ -112,41 +116,70 @@ with tab_chat:
                             st.json(log, expanded=False)
 
         if prompt := st.chat_input("Ask about the codebase..."):
-            st.session_state.messages.append({"role": "user", "content": prompt})
+            messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
                 with st.spinner("Agent working..."):
+                    server_url = os.getenv("REPOMIND_SERVER_URL", "http://localhost:8000")
+                    result = None
+                    msg = None
                     try:
-                        result = run_agent(prompt, selected)
+                        # Trigger agent run via Inngest — all steps visible in Dev UI
+                        trigger = httpx.post(
+                            f"{server_url}/api/query",
+                            json={"query": prompt, "collection_name": selected},
+                            timeout=10.0,
+                        )
+                        trigger.raise_for_status()
+                        session_id = trigger.json().get("session_id")
+
+                        # Poll for result (2s intervals, up to 4 minutes)
+                        for _ in range(120):
+                            time.sleep(2)
+                            try:
+                                poll = httpx.get(
+                                    f"{server_url}/api/result/{session_id}",
+                                    timeout=5.0,
+                                )
+                                if poll.status_code == 200:
+                                    result = poll.json()
+                                    break
+                            except Exception:
+                                pass
+
+                        if result is None:
+                            msg = "The agent did not respond in time. The Modal service may be cold-starting — try again in a moment."
+                            st.warning(msg)
+
+                    except httpx.ConnectError:
+                        msg = "Cannot reach the repomind server. Check that it is running."
+                        st.error(msg)
+                    except httpx.TimeoutException:
+                        msg = "Server did not respond in time. Check that the repomind server is running."
+                        st.error(msg)
+                    except httpx.HTTPStatusError as e:
+                        msg = f"Server returned an error ({e.response.status_code}). Check the repomind server logs."
+                        st.error(msg)
+                    except Exception:
+                        msg = "Something went wrong while running the agent. Please try again."
+                        st.error(msg)
+
+                    if result:
                         session_logs = get_session_logs(result["session_id"])
                         st.markdown(result["answer"])
                         with st.expander(f"Agent reasoning ({result['steps']} steps)"):
                             for log in session_logs:
                                 st.json(log, expanded=False)
-                        st.session_state.messages.append({
+                        messages.append({
                             "role": "assistant",
                             "content": result["answer"],
                             "steps": result["steps"],
                             "logs": session_logs,
                         })
-                    except httpx.TimeoutException:
-                        msg = "The LLM took too long to respond. The Modal service may be cold-starting — try again in a moment."
-                        st.warning(msg)
-                        st.session_state.messages.append({"role": "assistant", "content": msg})
-                    except httpx.ConnectError:
-                        msg = "Could not reach the LLM service. Check that `QWEN_GENERATE_URL` is set correctly in `.env`."
-                        st.error(msg)
-                        st.session_state.messages.append({"role": "assistant", "content": msg})
-                    except httpx.HTTPStatusError as e:
-                        msg = f"LLM service returned an error ({e.response.status_code}). Check the Modal deployment."
-                        st.error(msg)
-                        st.session_state.messages.append({"role": "assistant", "content": msg})
-                    except Exception as e:
-                        msg = f"Something went wrong while running the agent. Please try again."
-                        st.error(msg)
-                        st.session_state.messages.append({"role": "assistant", "content": msg})
+                    elif msg:
+                        messages.append({"role": "assistant", "content": msg})
 
 # ─── Tab 2: Logs ────────────────────────────────────────────────────────────
 with tab_logs:

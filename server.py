@@ -1,14 +1,20 @@
 """FastAPI + Inngest background job server for repomind.
 
-Three Inngest functions:
-  repomind/ingest_repo     — fetch + chunk (step 1) then embed + store (step 2)
-  repomind/run_agent       — full agent loop in one step; result cached for polling
-  repomind/agent_completed — post-run metrics hook fired by the sync Streamlit path
+Two Inngest functions:
+  repomind/ingest_repo  — fetch-and-chunk → validate-chunks →
+                          embed-and-store → log-summary
+  repomind/run_agent    — query-rewrite → llm-generate-N →
+                          vector-search-N / <tool>-N → ... →
+                          check-anomalies → log-summary
 
-Three REST helpers:
+Both Streamlit (via POST /api/query + poll) and direct API calls go through
+the same Inngest functions, so every run has full per-step visibility in the
+Inngest Dev UI.
+
+REST endpoints:
   POST /api/ingest             — trigger a repo ingest job
-  POST /api/query              — trigger an async agent run, returns session_id
-  GET  /api/result/{session_id} — poll for the agent result
+  POST /api/query              — trigger an agent run, returns event_id
+  GET  /api/result/{event_id}  — poll for the agent result
 
 Run with:
     uvicorn server:app --reload --port 8000
@@ -20,8 +26,8 @@ Inngest Dev UI is available at http://localhost:8288
 """
 from __future__ import annotations
 
-import asyncio
 import logging
+import uuid
 
 import inngest
 import inngest.fast_api
@@ -29,13 +35,12 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from eval.metrics import _estimate_cost_usd
 from ingest import embed_and_store_chunks, fetch_and_chunk_repo
 from inngest_setup import inngest_client
 
 logger = logging.getLogger("uvicorn")
 
-# In-memory cache for async agent results — keyed by full session_id UUID.
+# In-memory result cache keyed by event_id (used as session_id in run_agent_fn).
 _RESULT_CACHE: dict[str, dict] = {}
 
 
@@ -46,53 +51,117 @@ _RESULT_CACHE: dict[str, dict] = {}
     trigger=inngest.TriggerEvent(event="repomind/ingest_repo"),
 )
 async def ingest_repo_fn(ctx: inngest.Context) -> dict:
-    """Fetch a GitHub repo, chunk files, embed with Ollama, store in ChromaDB."""
+    """Fetch a GitHub repo, chunk, embed, and store in ChromaDB.
+
+    Steps:
+      fetch-and-chunk  — walk repo, apply AST/naive chunking, write temp JSONL
+      validate-chunks  — flag empty result before spending time on embeddings
+      embed-and-store  — embed every chunk via Modal, upsert ChromaDB
+      log-summary      — structured log with totals, errors, and latency
+    """
     repo_slug: str = ctx.event.data["repo"]
     mode: str = ctx.event.data.get("mode", "ast")
     event_id: str = ctx.event.id
 
+    # Step 1: fetch and chunk
     chunks_data = await ctx.step.run(
         "fetch-and-chunk",
         lambda: fetch_and_chunk_repo(repo_slug, mode, event_id=event_id),
     )
+
+    # Step 2: validate before embedding
+    def _validate(d: dict) -> dict:
+        issues = []
+        if d.get("files_seen", 0) == 0:
+            issues.append("no_files_found")
+        if d.get("total_chunks", 0) == 0:
+            issues.append("no_chunks_produced")
+        if issues:
+            logger.warning(
+                "repomind/ingest_repo validate: repo=%s issues=%s",
+                repo_slug, issues,
+            )
+        return {"valid": len(issues) == 0, "issues": issues}
+
+    validated = await ctx.step.run("validate-chunks", lambda: _validate(chunks_data))
+
+    # Step 3: embed and store
     result = await ctx.step.run(
         "embed-and-store",
         lambda: embed_and_store_chunks(chunks_data),
     )
-    logger.info(
-        "repomind/ingest_repo done: %d chunks → collection '%s'",
-        result["total_chunks"],
-        result["collection_name"],
-    )
+
+    # Step 4: log summary
+    def _log_summary(r: dict, v: dict) -> dict:
+        embed_errors = r.get("embed_errors", 0)
+        msg = (
+            f"repomind/ingest_repo done: repo={repo_slug} "
+            f"collection={r['collection_name']} chunks={r['total_chunks']} "
+            f"files={r.get('files_seen', 0)} embed_errors={embed_errors}"
+        )
+        if v["issues"] or embed_errors > 0:
+            logger.warning(msg + f" issues={v['issues']}")
+        else:
+            logger.info(msg)
+        return {"logged": True}
+
+    await ctx.step.run("log-summary", lambda: _log_summary(result, validated))
     return result
 
 
-# ─── Inngest function 2: async agent run ────────────────────────────────────
+# ─── Inngest function 2: agent run ──────────────────────────────────────────
 
 @inngest_client.create_function(
     fn_id="repomind-run-agent",
     trigger=inngest.TriggerEvent(event="repomind/run_agent"),
 )
 async def run_agent_fn(ctx: inngest.Context) -> dict:
-    """ReAct loop driven step-by-step so each tool call is a visible Inngest checkpoint."""
+    """ReAct loop driven step-by-step — each LLM call and tool call is a
+    separate timed checkpoint in the Inngest Dev UI.
+
+    Steps:
+      query-rewrite       — compact semantic-search rewrite of the user query
+      llm-generate-N      — Qwen generates Thought + Action (or Final Answer)
+      vector-search-N /   — tool execution; embed_ms + chroma_ms captured
+        <tool>-N
+      check-anomalies     — flag max_steps_reached, no_action, high latency
+      log-summary         — structured log with steps, latency, stop reason
+    """
     import time
-    import uuid
     from agent import _generate, _parse_action, query_rewrite
+    from logger import log_step
     from prompts import REACT_PROMPT_TEMPLATE
     from tools import _TOOL_METRICS, run_tool
 
     query: str = ctx.event.data["query"]
     collection_name: str = ctx.event.data["collection_name"]
-    session_id = str(uuid.uuid4())
+    # session_id is generated by /api/query and passed in event data so the
+    # caller can poll /api/result/{session_id} without depending on Inngest's
+    # internal event ID format.
+    session_id: str = ctx.event.data.get("session_id") or ctx.event.id
     run_start = time.time()
 
-    # Step 1 — rewrite the query for semantic search
-    rewritten: str = await ctx.step.run(
-        "query-rewrite",
-        lambda: query_rewrite(query),
-    )
+    # Step: query-rewrite — log_step is inside the lambda so it only runs once,
+    # not on every Inngest replay.
+    def _query_rewrite() -> str:
+        import time as _t
+        t = _t.time()
+        result = query_rewrite(query)
+        log_step(session_id, 0, "query_rewrite", {
+            "original": query,
+            "rewritten": result,
+            "latency_s": round(_t.time() - t, 2),
+        })
+        return result
+
+    rewritten: str = await ctx.step.run("query-rewrite", _query_rewrite)
 
     scratchpad = ""
+    answer = "Could not find a complete answer after max steps."
+    stop_reason = "max_steps_reached"
+    total_embed_ms = 0
+    total_chroma_ms = 0
+    step_num = 0
 
     for step_num in range(1, 7):
         prompt = REACT_PROMPT_TEMPLATE.format(
@@ -101,7 +170,7 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
             scratchpad=scratchpad,
         )
 
-        # LLM generate — step so timing is visible in Inngest and result is memoized on retry
+        # Step: llm-generate-N
         raw: str = await ctx.step.run(
             f"llm-generate-{step_num}",
             lambda p=prompt: _generate(p, max_new_tokens=1000, temperature=0.2),
@@ -109,134 +178,131 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
 
         if "Final Answer:" in raw:
             answer = raw.split("Final Answer:", 1)[-1].strip()
-            result = {
-                "session_id": session_id,
-                "answer": answer,
-                "steps": step_num,
-                "total_latency_s": round(time.time() - run_start, 2),
-            }
-            _RESULT_CACHE[session_id] = result
-            logger.info("repomind/run_agent done: session=%s steps=%d", session_id, step_num)
-            return result
+            stop_reason = "final_answer"
+            # Log inside its own step so it runs exactly once
+            _ans, _sn = answer, step_num
+            await ctx.step.run(
+                f"log-final-answer-{step_num}",
+                lambda: log_step(session_id, _sn, "final_answer", {
+                    "answer": _ans,
+                    "total_latency_s": round(time.time() - run_start, 2),
+                    "total_steps": _sn,
+                }) or {},
+            )
+            break
 
         parsed = _parse_action(raw)
         if parsed is None:
-            result = {
-                "session_id": session_id,
-                "answer": raw,
-                "steps": step_num,
-                "total_latency_s": round(time.time() - run_start, 2),
-            }
-            _RESULT_CACHE[session_id] = result
-            return result
+            answer = raw
+            stop_reason = "no_action"
+            _sn = step_num
+            await ctx.step.run(
+                f"log-unexpected-stop-{step_num}",
+                lambda: log_step(session_id, _sn, "unexpected_stop", {}) or {},
+            )
+            break
 
         tool_name, args = parsed
+        step_label = (
+            f"vector-search-{step_num}" if tool_name == "vector_search"
+            else f"{tool_name}-{step_num}"
+        )
 
-        # Each tool call is its own step — vector_search gets a descriptive label
-        if tool_name == "vector_search":
-            step_label = f"vector-search-{step_num}"
-        else:
-            step_label = f"{tool_name}-{step_num}"
-
-        def _run_tool(tn=tool_name, a=args) -> dict:
+        # Tool step: log_step for tool_call and tool_result are inside the
+        # lambda so they execute exactly once even across Inngest replays.
+        def _run_tool(tn=tool_name, a=args, sn=step_num) -> dict:
+            import time as _t
+            log_step(session_id, sn, "tool_call", {"tool": tn, "args": a})
             _TOOL_METRICS.set({})
+            t = _t.time()
             res = run_tool(tn, a, collection_name)
+            tool_latency = round(_t.time() - t, 2)
             m = _TOOL_METRICS.get({})
+            result_str = str(res)
+            log_step(session_id, sn, "tool_result", {
+                "tool": tn,
+                "result_preview": result_str[:200],
+                "result_chars": len(result_str),
+                "tool_latency_s": tool_latency,
+                "embed_ms": m.get("embed_ms"),
+                "chroma_ms": m.get("chroma_ms"),
+            })
             return {
-                "result": res,
+                "result": result_str,
                 "embed_ms": m.get("embed_ms"),
                 "chroma_ms": m.get("chroma_ms"),
             }
 
+        # Step: vector-search-N / <tool>-N
         step_out: dict = await ctx.step.run(step_label, _run_tool)
+        total_embed_ms += step_out.get("embed_ms") or 0
+        total_chroma_ms += step_out.get("chroma_ms") or 0
         scratchpad += raw + f"\nObservation: {step_out['result']}\n\n"
+
+    total_latency_s = round(time.time() - run_start, 2)
+
+    if stop_reason == "max_steps_reached":
+        _sn = step_num
+        await ctx.step.run(
+            "log-max-steps",
+            lambda: log_step(session_id, _sn, "max_steps_reached", {
+                "total_latency_s": total_latency_s,
+            }) or {},
+        )
+
+    # Step: check-anomalies
+    def _check_anomalies(sr: str, steps: int, latency: float) -> dict:
+        flags = []
+        if sr in ("max_steps_reached", "no_action"):
+            flags.append(f"incomplete_run:{sr}")
+        if latency > 120:
+            flags.append(f"high_latency:{latency}s")
+        return {"flags": flags, "flagged": len(flags) > 0}
+
+    anomalies = await ctx.step.run(
+        "check-anomalies",
+        lambda: _check_anomalies(stop_reason, step_num, total_latency_s),
+    )
+
+    # Step: log-summary
+    def _log_summary(sid: str, steps: int, latency: float, sr: str,
+                     emb: int, chro: int, flags: list) -> dict:
+        msg = (
+            f"repomind/run_agent done: session={sid[:8]} steps={steps} "
+            f"latency={latency}s stop={sr} "
+            f"embed_ms={emb or None} chroma_ms={chro or None}"
+        )
+        if flags:
+            logger.warning(msg + f" flags={flags}")
+        else:
+            logger.info(msg)
+        return {"logged": True}
+
+    await ctx.step.run(
+        "log-summary",
+        lambda: _log_summary(
+            session_id, step_num, total_latency_s, stop_reason,
+            total_embed_ms, total_chroma_ms, anomalies["flags"],
+        ),
+    )
 
     result = {
         "session_id": session_id,
-        "answer": "Could not find a complete answer after max steps.",
-        "steps": 6,
-        "total_latency_s": round(time.time() - run_start, 2),
+        "answer": answer,
+        "steps": step_num,
+        "stop_reason": stop_reason,
+        "total_latency_s": total_latency_s,
+        "embed_ms": total_embed_ms or None,
+        "chroma_ms": total_chroma_ms or None,
     }
     _RESULT_CACHE[session_id] = result
     return result
 
 
-# ─── Inngest function 3: Streamlit path step checkpoints ────────────────────
-
-@inngest_client.create_function(
-    fn_id="repomind-streamlit-step",
-    trigger=inngest.TriggerEvent(event="repomind/streamlit_step"),
-)
-async def streamlit_step_fn(ctx: inngest.Context) -> dict:
-    """Receives per-stage events fired by the synchronous Streamlit agent path.
-
-    Each stage (query_rewrite, llm_generate, tool_call, final_answer, *_error)
-    fires a separate repomind/streamlit_step event from agent.py. This function
-    runs a single log-step so every stage appears as a separate timed run in
-    the Inngest Dev UI — giving the same per-step visibility as the async path.
-    """
-    data = ctx.event.data
-
-    def _log(d: dict) -> dict:
-        step = d.get("step", "unknown")
-        session = d.get("session_id", "?")[:8]
-        latency = d.get("latency_ms") or d.get("total_latency_ms")
-        if "error" in step:
-            logger.warning(
-                "streamlit step ERROR: session=%s step=%s error=%s",
-                session, step, d.get("error", "?"),
-            )
-        else:
-            logger.info(
-                "streamlit step: session=%s step=%s latency_ms=%s",
-                session, step, latency,
-            )
-        return d
-
-    return await ctx.step.run("log-step", lambda: _log(data))
-
-
-# ─── Inngest function 4: post-run metrics hook ──────────────────────────────
-
-@inngest_client.create_function(
-    fn_id="repomind-agent-completed",
-    trigger=inngest.TriggerEvent(event="repomind/agent_completed"),
-)
-async def agent_completed_fn(ctx: inngest.Context) -> dict:
-    """Post-processing for every completed agent run (fired by the sync Streamlit path)."""
-    data = ctx.event.data
-
-    def _compute(d: dict) -> dict:
-        input_tok = d.get("input_tokens", 0)
-        output_tok = d.get("output_tokens", 0)
-        cost_usd = _estimate_cost_usd(input_tok, output_tok)
-        return {
-            "session_id": d.get("session_id"),
-            "query": (d.get("query") or "")[:120],
-            "steps": d.get("steps", 0),
-            "stop_reason": d.get("stop_reason", "end_turn"),
-            "input_tokens": input_tok,
-            "output_tokens": output_tok,
-            "cost_usd": round(cost_usd, 6),
-            "total_latency_s": d.get("total_latency_s"),
-            "embed_ms": d.get("embed_ms"),
-            "chroma_ms": d.get("chroma_ms"),
-        }
-
-    metrics = await ctx.step.run("compute-metrics", lambda: _compute(data))
-    logger.info(
-        "repomind/agent_completed: session=%s steps=%d $%.6f",
-        metrics["session_id"],
-        metrics["steps"],
-        metrics["cost_usd"],
-    )
-    return metrics
-
-
 # ─── FastAPI app ─────────────────────────────────────────────────────────────
 
-app = FastAPI(title="repomind server")  # 4 Inngest functions registered below
-inngest.fast_api.serve(app, inngest_client, [ingest_repo_fn, run_agent_fn, streamlit_step_fn, agent_completed_fn])
+app = FastAPI(title="repomind server")
+inngest.fast_api.serve(app, inngest_client, [ingest_repo_fn, run_agent_fn])
 
 
 class IngestRequest(BaseModel):
@@ -265,14 +331,19 @@ async def trigger_ingest(req: IngestRequest):
 
 @app.post("/api/query")
 async def trigger_query(req: QueryRequest):
-    """Trigger an async agent run. Poll /api/result/{session_id} for the answer."""
-    event = await inngest_client.send(
+    """Trigger an agent run. Poll /api/result/{session_id} for the answer."""
+    session_id = str(uuid.uuid4())
+    await inngest_client.send(
         inngest.Event(
             name="repomind/run_agent",
-            data={"query": req.query, "collection_name": req.collection_name},
+            data={
+                "query": req.query,
+                "collection_name": req.collection_name,
+                "session_id": session_id,
+            },
         )
     )
-    return {"status": "triggered", "event_id": getattr(event, "id", None)}
+    return {"status": "triggered", "session_id": session_id}
 
 
 @app.get("/api/result/{session_id}")

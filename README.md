@@ -166,6 +166,44 @@ Three Inngest functions run in the background:
 
 Each step shows its own duration in the timeline. LLM generate steps are also memoized — on retry, already-completed steps are not re-called.
 
+### Event payloads
+
+**`repomind/ingest_repo`** — triggered when you click "Ingest repo" in the sidebar:
+```json
+{
+  "name": "repomind/ingest_repo",
+  "data": {
+    "repo": "GodsScion/Auto_job_applier_linkedIn",
+    "mode": "ast"
+  }
+}
+```
+
+**`repomind/run_agent`** — triggered by `POST /api/query`:
+```json
+{
+  "name": "repomind/run_agent",
+  "data": {
+    "query": "How does the login flow work?",
+    "collection_name": "GodsScion_Auto_job_applier_linkedIn_ast"
+  }
+}
+```
+
+**`repomind/agent_completed`** — fired automatically after every Streamlit chat query:
+```json
+{
+  "name": "repomind/agent_completed",
+  "data": {
+    "session_id": "abc123",
+    "query": "How does the login flow work?",
+    "latency_ms": 3200,
+    "input_tokens": 1540,
+    "output_tokens": 320
+  }
+}
+```
+
 ## Architecture & Challenges
 
 ### How the agent works

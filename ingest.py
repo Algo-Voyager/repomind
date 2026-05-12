@@ -294,11 +294,11 @@ def fetch_and_chunk_repo(repo_slug: str, mode: str, event_id: str = "cli") -> di
         for entry in walk_repo(gh, repo):
             if os.path.splitext(entry.path)[1] not in ALLOWED_EXTS:
                 continue
-            data = fetch_file_bytes(gh, entry)
-            if data is None or is_binary(data):
+            raw = fetch_file_bytes(gh, entry)
+            if raw is None or is_binary(raw):
                 continue
             try:
-                text = data.decode("utf-8")
+                text = raw.decode("utf-8")
             except UnicodeDecodeError:
                 continue
             files_seen += 1
@@ -372,6 +372,7 @@ def embed_and_store_chunks(chunks_data: dict) -> dict:
     return {
         "collection_name": collection_name,
         "total_chunks": total,
+        "embed_errors": errors,
         "files_seen": chunks_data.get("files_seen", 0),
     }
 
