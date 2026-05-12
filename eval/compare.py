@@ -2,13 +2,12 @@
 
 For each benchmark query, retrieves the top-N chunks from the AST and
 naive collections and asks Claude to rate each chunk's relevance 1-5.
-Writes ``benchmark_results.json`` (gitignored).
+Writes ``frontend/public/benchmark_results.json`` (gitignored).
 
 Usage:
     python eval/compare.py <owner>/<repo>
 
-Embedding retrieval uses the same Ollama ``nomic-embed-text`` model as
-ingest; only the judge is on the Claude API.
+Embedding retrieval uses the same Modal EMBED_BASE_URL as ingest/tools.
 """
 
 from __future__ import annotations
@@ -21,26 +20,41 @@ from statistics import mean
 
 import anthropic
 import chromadb
-import ollama
+import openai
 from dotenv import load_dotenv
 
 load_dotenv()
 
-JUDGE_MODEL = "claude-opus-4-7"
-EMBED_MODEL = "nomic-embed-text"
-CHROMA_PATH = "./chroma_db"
+JUDGE_MODEL   = "claude-opus-4-7"
+EMBED_MODEL   = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+CHROMA_PATH   = "./chroma_db"
+OUTPUT_PATH   = Path("frontend/public/benchmark_results.json")
 
-_client: anthropic.Anthropic | None = None
+_judge: anthropic.Anthropic | None = None
+_embed: openai.OpenAI | None = None
 
 
-def _get_client() -> anthropic.Anthropic:
-    global _client
-    if _client is None:
+def _get_judge() -> anthropic.Anthropic:
+    global _judge
+    if _judge is None:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to .env.")
-        _client = anthropic.Anthropic(api_key=api_key)
-    return _client
+        _judge = anthropic.Anthropic(api_key=api_key)
+    return _judge
+
+
+def _get_embed() -> openai.OpenAI:
+    global _embed
+    if _embed is None:
+        base_url = os.getenv("EMBED_BASE_URL")
+        if not base_url:
+            raise RuntimeError("EMBED_BASE_URL is not set. Add it to .env.")
+        _embed = openai.OpenAI(
+            base_url=base_url,
+            api_key=os.getenv("VLLM_API_KEY", ""),
+        )
+    return _embed
 
 
 BENCHMARK_QUERIES = [
@@ -56,11 +70,14 @@ BENCHMARK_QUERIES = [
 
 
 def retrieve(collection_name: str, query: str, n: int = 3) -> list[dict]:
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
-    col = client.get_collection(collection_name)
-    emb = ollama.embeddings(model=EMBED_MODEL, prompt=query)
+    chroma = chromadb.PersistentClient(path=CHROMA_PATH)
+    col = chroma.get_collection(collection_name)
+
+    resp = _get_embed().embeddings.create(model=EMBED_MODEL, input=query)
+    embedding = resp.data[0].embedding
+
     results = col.query(
-        query_embeddings=[emb["embedding"]],
+        query_embeddings=[embedding],
         n_results=n,
         include=["documents", "metadatas", "distances"],
     )
@@ -92,7 +109,7 @@ Scoring:
 
 Respond with ONLY a single digit 1-5. Nothing else."""
 
-    response = _get_client().messages.create(
+    response = _get_judge().messages.create(
         model=JUDGE_MODEL,
         max_tokens=10,
         messages=[{"role": "user", "content": prompt}],
@@ -105,69 +122,67 @@ Respond with ONLY a single digit 1-5. Nothing else."""
 
 
 def run_benchmark(repo_owner: str, repo_name: str) -> dict:
-    ast_col = f"{repo_owner}_{repo_name}_ast"
+    ast_col   = f"{repo_owner}_{repo_name}_ast"
     naive_col = f"{repo_owner}_{repo_name}_naive"
+
+    print(f"Comparing  {ast_col}  vs  {naive_col}")
 
     results: list[dict] = []
     for query in BENCHMARK_QUERIES:
-        print(f"\n🔍 {query}")
+        print(f"\n  query: {query}")
 
-        ast_chunks = retrieve(ast_col, query)
+        ast_chunks   = retrieve(ast_col,   query)
         naive_chunks = retrieve(naive_col, query)
 
-        ast_scores = [score_chunk(c["text"], query) for c in ast_chunks]
+        ast_scores   = [score_chunk(c["text"], query) for c in ast_chunks]
         naive_scores = [score_chunk(c["text"], query) for c in naive_chunks]
 
-        ast_avg = mean(ast_scores) if ast_scores else 0.0
-        naive_avg = mean(naive_scores) if naive_scores else 0.0
+        ast_avg   = round(mean(ast_scores),   2) if ast_scores   else 0.0
+        naive_avg = round(mean(naive_scores), 2) if naive_scores else 0.0
 
         if ast_avg > naive_avg:
-            winner = "AST"
+            winner = "ast"
         elif naive_avg > ast_avg:
-            winner = "Naive"
+            winner = "naive"
         else:
-            winner = "Tie"
+            winner = "tie"
 
         results.append({
-            "query": query,
-            "ast_avg_score": round(ast_avg, 2),
-            "naive_avg_score": round(naive_avg, 2),
-            "ast_scores": ast_scores,
-            "naive_scores": naive_scores,
-            "winner": winner,
-            "delta": round(ast_avg - naive_avg, 2),
+            "query":           query,
+            "ast_avg_score":   ast_avg,
+            "naive_avg_score": naive_avg,
+            "ast_scores":      ast_scores,
+            "naive_scores":    naive_scores,
+            "winner":          winner,
+            "delta":           round(ast_avg - naive_avg, 2),
         })
+        print(f"    AST {ast_avg:.1f}  |  Naive {naive_avg:.1f}  |  {winner.upper()} wins")
 
-        print(
-            f"   AST: {ast_avg:.1f} | Naive: {naive_avg:.1f} | "
-            f"Winner: {winner} (+{abs(results[-1]['delta'])})"
-        )
-
-    ast_wins = sum(1 for r in results if r["winner"] == "AST")
-    naive_wins = sum(1 for r in results if r["winner"] == "Naive")
-    ties = sum(1 for r in results if r["winner"] == "Tie")
+    ast_wins   = sum(1 for r in results if r["winner"] == "ast")
+    naive_wins = sum(1 for r in results if r["winner"] == "naive")
+    ties       = sum(1 for r in results if r["winner"] == "tie")
 
     summary = {
-        "total_queries": len(results),
-        "ast_wins": ast_wins,
-        "naive_wins": naive_wins,
-        "ties": ties,
-        "avg_ast_score": round(mean(r["ast_avg_score"] for r in results), 2),
-        "avg_naive_score": round(mean(r["naive_avg_score"] for r in results), 2),
-        "results": results,
+        "repo":             f"{repo_owner}/{repo_name}",
+        "total_queries":    len(results),
+        "ast_wins":         ast_wins,
+        "naive_wins":       naive_wins,
+        "ties":             ties,
+        "avg_ast_score":    round(mean(r["ast_avg_score"]   for r in results), 2),
+        "avg_naive_score":  round(mean(r["naive_avg_score"] for r in results), 2),
+        "results":          results,
     }
 
-    Path("benchmark_results.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf-8"
-    )
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_PATH.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     print(f"\n{'=' * 60}")
-    print("📊 BENCHMARK SUMMARY")
-    print(f"   AST wins:   {ast_wins}/{len(results)}")
-    print(f"   Naive wins: {naive_wins}/{len(results)}")
-    print(f"   Ties:       {ties}/{len(results)}")
-    print(f"   Avg AST score:   {summary['avg_ast_score']}")
-    print(f"   Avg Naive score: {summary['avg_naive_score']}")
+    print(f"  AST wins:   {ast_wins}/{len(results)}")
+    print(f"  Naive wins: {naive_wins}/{len(results)}")
+    print(f"  Ties:       {ties}/{len(results)}")
+    print(f"  Avg AST:    {summary['avg_ast_score']}")
+    print(f"  Avg Naive:  {summary['avg_naive_score']}")
+    print(f"\n  Results written to {OUTPUT_PATH}")
 
     return summary
 
