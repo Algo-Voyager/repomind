@@ -12,7 +12,7 @@ All core modules are implemented: `ingest.py`, `tools.py`, `prompts.py`, `logger
 # One-time setup
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in VLLM_API_KEY, QWEN_GENERATE_URL, EMBED_BASE_URL, GITHUB_TOKEN, ANTHROPIC_API_KEY
+cp .env.example .env   # fill in VLLM_API_KEY, QWEN_GENERATE_URL, EMBED_BASE_URL, GITHUB_TOKEN
 
 # Deploy Modal services from rag-learning (LLM + embeddings)
 cd ../rag-learning && modal deploy qwen_modal.py && cd ../repomind
@@ -31,7 +31,7 @@ python ingest.py <owner/repo> <ast|naive>
 python tools.py <owner>_<repo>_<mode>
 python agent.py <owner>_<repo>_<mode> "your question here"
 
-# ── Benchmark (requires ANTHROPIC_API_KEY + both AST/naive collections) ──────
+# ── Benchmark (requires both AST and naive collections ingested) ─────────────
 python eval/compare.py <owner>/<repo>
 # Writes results to frontend/public/benchmark_results.json
 ```
@@ -48,7 +48,7 @@ The system is a from-scratch RAG agent — **no LangChain, no LlamaIndex**. Keep
 
 2. At query time, `frontend/` sends a `POST /api/query` to `server.py`, which triggers an Inngest `repomind/run_agent` event. The frontend polls `GET /api/result/{event_id}` until the result is ready. The agent in `agent.py` runs a text-based **ReAct loop**: it POSTs to `QWEN_GENERATE_URL` (`httpx`), parses the model's `Action:` / `Action Input:` text output, runs the tool, appends `Observation:` to the prompt, and repeats until `Final Answer:` appears.
 
-3. Conversation history is managed by the frontend in a `contextRef` (per-collection). The backend accepts `history: list[dict]` in the query body, optionally compresses it (at 12 K chars, keeps last 4 pairs verbatim, summarizes the rest with Claude), and returns `compressed_history` in the result for the frontend to store.
+3. Conversation history is managed by the frontend in a `contextRef` (per-collection). The backend accepts `history: list[dict]` in the query body, optionally compresses it (at 12 K chars, keeps last 4 pairs verbatim, summarizes the rest with Qwen via `COMPRESS_HISTORY_PROMPT`), and returns `compressed_history` in the result for the frontend to store.
 
 4. Every tool call goes through `tools.py`. `vector_search` embeds the query via the Modal embedding API and queries ChromaDB. Latency (`embed_ms`, `chroma_ms`) is tracked in a `_TOOL_METRICS` ContextVar and reported in `log_step`.
 
@@ -69,7 +69,7 @@ The system is a from-scratch RAG agent — **no LangChain, no LlamaIndex**. Keep
   - `components/Sidebar.tsx` — resizable (160–400px drag handle); Lucide icon nav; ingest trigger; indexed repos list
   - `components/ui/animated-ai-chat.tsx` — `AnimatedTextarea`, `TypingDots`, `useAutoResizeTextarea`
   - `lib/api.ts` — `triggerQuery(query, collection, history)`, `pollResult(eventId)`, `fetchCollections()`, `ingestRepo(repo, mode)`
-- `eval/compare.py` — AST vs naive benchmark. Uses Modal embeddings (`openai.OpenAI(base_url=EMBED_BASE_URL)`) and Claude as judge (`ANTHROPIC_API_KEY`). Writes to `frontend/public/benchmark_results.json`.
+- `eval/compare.py` — AST vs naive benchmark. Uses Modal embeddings (`openai.OpenAI(base_url=EMBED_BASE_URL)`) and Qwen as judge (`QWEN_GENERATE_URL`). Writes to `frontend/public/benchmark_results.json`.
 - `eval/metrics.py` — reads `agent_logs.jsonl`, computes per-session + aggregate stats.
 - `eval/test_queries.py` — correctness harness over 5 fixed queries with keyword scoring.
 
@@ -77,7 +77,6 @@ The system is a from-scratch RAG agent — **no LangChain, no LlamaIndex**. Keep
 
 - **LLM**: `Qwen/Qwen2.5-7B-Instruct` via rag-learning's `QwenService` on Modal. Endpoint: `QWEN_GENERATE_URL`. Request: `{"prompt": str, "max_new_tokens": int, "temperature": float}`. Response: `{"response": str}`. Called via `httpx.post`. **Not OpenAI-compatible** — no function calling, which is why the agent uses a text-based ReAct loop.
 - **Embeddings**: `BAAI/bge-small-en-v1.5` via rag-learning's `embedding_api` on Modal. Endpoint: `EMBED_BASE_URL` (must include `/v1` suffix). OpenAI-compatible `/v1/embeddings`. Called via `openai.OpenAI(base_url=EMBED_BASE_URL)`. Produces 384-dim vectors.
-- **Judge LLM** (eval only): `claude-opus-4-7` via Anthropic API (`ANTHROPIC_API_KEY`). Used only in `eval/compare.py`.
 - **Vector store**: ChromaDB persistent client at `./chroma_db` (gitignored). Rebuild with `python ingest.py`. Switching embedding models requires full re-ingest (vector dimensions change).
 
 ## Key env vars
@@ -89,7 +88,6 @@ The system is a from-scratch RAG agent — **no LangChain, no LlamaIndex**. Keep
 | `EMBED_BASE_URL` | tools.py, ingest.py, eval/compare.py | Must end with `/v1` |
 | `EMBED_MODEL` | tools.py, ingest.py, eval/compare.py | `BAAI/bge-small-en-v1.5` |
 | `GITHUB_TOKEN` | ingest.py, tools.py | Repo read access |
-| `ANTHROPIC_API_KEY` | eval/compare.py | LLM-as-judge for benchmark |
 
 ## Secrets and generated files
 

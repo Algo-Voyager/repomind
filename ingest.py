@@ -73,39 +73,111 @@ def should_skip_path(path: str) -> bool:
     return any(p in SKIP_DIRS for p in parts)
 
 
+def _sub_chunk(text: str, base_id: str, base_meta: dict) -> list[Chunk]:
+    """Split oversized text into overlapping character windows (same logic as naive_chunk)."""
+    step = CHUNK_CHARS - CHUNK_OVERLAP
+    chunks = []
+    part = 0
+    i = 0
+    while i < len(text):
+        window = text[i : i + CHUNK_CHARS]
+        if window.strip():
+            chunks.append(Chunk(
+                chunk_id=f"{base_id}::part{part}",
+                text=window,
+                metadata={**base_meta, "part": part},
+            ))
+            part += 1
+        i += step
+    return chunks
+
+
+def _ast_function_chunks(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    lines: list[str],
+    file_path: str,
+) -> list[Chunk]:
+    """One chunk per function/method; sub-chunks if the body exceeds CHUNK_CHARS."""
+    if node.end_lineno is None:
+        return []
+    text = "\n".join(lines[node.lineno - 1 : node.end_lineno])
+    docstring = ast.get_docstring(node) or ""
+    base_id = f"{file_path}::function::{node.name}::{node.lineno}"
+    base_meta: dict = {
+        "type": "function",
+        "name": node.name,
+        "file_path": file_path,
+        "line_start": node.lineno,
+        "line_end": node.end_lineno,
+        "docstring": docstring,
+        "language": "python",
+    }
+    if len(text) <= CHUNK_CHARS:
+        return [Chunk(chunk_id=base_id, text=text, metadata=base_meta)]
+    return _sub_chunk(text, base_id, base_meta)
+
+
+def _ast_class_header_chunk(node: ast.ClassDef, lines: list[str], file_path: str) -> Chunk:
+    """Class chunk contains only the class signature + docstring + class-level
+    attributes.  Method bodies are excluded — each method is its own chunk.
+    This prevents the same code appearing in both the class chunk and the
+    method chunk (the duplication the old ast.walk approach caused).
+    """
+    # Find where the first method starts so we can trim before it.
+    first_method_line: int | None = None
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if first_method_line is None or child.lineno < first_method_line:
+                first_method_line = child.lineno
+
+    if first_method_line is not None:
+        header = lines[node.lineno - 1 : first_method_line - 1]
+        while header and not header[-1].strip():
+            header.pop()
+        text = "\n".join(header) if header else "\n".join(lines[node.lineno - 1 : node.end_lineno])
+    else:
+        # No methods — use the full class body.
+        text = "\n".join(lines[node.lineno - 1 : node.end_lineno])
+
+    docstring = ast.get_docstring(node) or ""
+    return Chunk(
+        chunk_id=f"{file_path}::class::{node.name}::{node.lineno}",
+        text=text,
+        metadata={
+            "type": "class",
+            "name": node.name,
+            "file_path": file_path,
+            "line_start": node.lineno,
+            "line_end": node.end_lineno,
+            "docstring": docstring,
+            "language": "python",
+        },
+    )
+
+
 def extract_python_ast_chunks(source: str, file_path: str) -> list[Chunk]:
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return []
+
     lines = source.splitlines()
     chunks: list[Chunk] = []
-    for node in ast.walk(tree):
+
+    # Iterate only over top-level module statements (not ast.walk which would
+    # visit nested nodes and cause method bodies to appear in both the class
+    # chunk and the individual method chunks).
+    for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            node_type = "function"
+            chunks.extend(_ast_function_chunks(node, lines, file_path))
         elif isinstance(node, ast.ClassDef):
-            node_type = "class"
-        else:
-            continue
-        if node.end_lineno is None:
-            continue
-        text = "\n".join(lines[node.lineno - 1 : node.end_lineno])
-        docstring = ast.get_docstring(node) or ""
-        chunks.append(
-            Chunk(
-                chunk_id=f"{file_path}::{node_type}::{node.name}::{node.lineno}",
-                text=text,
-                metadata={
-                    "type": node_type,
-                    "name": node.name,
-                    "file_path": file_path,
-                    "line_start": node.lineno,
-                    "line_end": node.end_lineno,
-                    "docstring": docstring,
-                    "language": "python",
-                },
-            )
-        )
+            if node.end_lineno is None:
+                continue
+            chunks.append(_ast_class_header_chunk(node, lines, file_path))
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    chunks.extend(_ast_function_chunks(child, lines, file_path))
+
     return chunks
 
 

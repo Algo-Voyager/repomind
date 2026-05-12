@@ -1,7 +1,7 @@
-"""AST vs naive chunking benchmark — LLM-as-judge with Claude.
+"""AST vs naive chunking benchmark — LLM-as-judge with Qwen.
 
 For each benchmark query, retrieves the top-N chunks from the AST and
-naive collections and asks Claude to rate each chunk's relevance 1-5.
+naive collections and asks Qwen to rate each chunk's relevance 1-5.
 Writes ``frontend/public/benchmark_results.json`` (gitignored).
 
 Usage:
@@ -18,30 +18,22 @@ import sys
 from pathlib import Path
 from statistics import mean
 
-import anthropic
-import chromadb
+import time
+
+import httpx
 import openai
 from dotenv import load_dotenv
 
 load_dotenv()
 
-JUDGE_MODEL   = "claude-opus-4-7"
 EMBED_MODEL   = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 CHROMA_PATH   = "./chroma_db"
 OUTPUT_PATH   = Path("frontend/public/benchmark_results.json")
 
-_judge: anthropic.Anthropic | None = None
+QWEN_GENERATE_URL = os.getenv("QWEN_GENERATE_URL", "")
+VLLM_API_KEY      = os.getenv("VLLM_API_KEY", "")
+
 _embed: openai.OpenAI | None = None
-
-
-def _get_judge() -> anthropic.Anthropic:
-    global _judge
-    if _judge is None:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to .env.")
-        _judge = anthropic.Anthropic(api_key=api_key)
-    return _judge
 
 
 def _get_embed() -> openai.OpenAI:
@@ -52,9 +44,38 @@ def _get_embed() -> openai.OpenAI:
             raise RuntimeError("EMBED_BASE_URL is not set. Add it to .env.")
         _embed = openai.OpenAI(
             base_url=base_url,
-            api_key=os.getenv("VLLM_API_KEY", ""),
+            api_key=VLLM_API_KEY,
         )
     return _embed
+
+
+def _qwen(prompt: str, retries: int = 3) -> str:
+    if not QWEN_GENERATE_URL:
+        raise RuntimeError("QWEN_GENERATE_URL is not set. Add it to .env.")
+    for attempt in range(1, retries + 1):
+        try:
+            resp = httpx.post(
+                QWEN_GENERATE_URL,
+                json={"prompt": prompt, "max_new_tokens": 64, "temperature": 0.1},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {VLLM_API_KEY}",
+                },
+                timeout=120.0,
+            )
+            if resp.status_code >= 500:
+                print(f"    [attempt {attempt}/{retries}] Qwen 500 — {'retrying in 10s…' if attempt < retries else 'giving up.'}")
+                if attempt < retries:
+                    time.sleep(10)
+                    continue
+                raise RuntimeError(f"Qwen service error 500 after {retries} attempts: {resp.text[:300]}")
+            resp.raise_for_status()
+            return resp.json().get("response", "").strip()
+        except httpx.TimeoutException:
+            print(f"    [attempt {attempt}/{retries}] Timeout — {'retrying…' if attempt < retries else 'giving up.'}")
+            if attempt == retries:
+                raise
+    return ""
 
 
 BENCHMARK_QUERIES = [
@@ -70,6 +91,7 @@ BENCHMARK_QUERIES = [
 
 
 def retrieve(collection_name: str, query: str, n: int = 3) -> list[dict]:
+    import chromadb
     chroma = chromadb.PersistentClient(path=CHROMA_PATH)
     col = chroma.get_collection(collection_name)
 
@@ -109,14 +131,12 @@ Scoring:
 
 Respond with ONLY a single digit 1-5. Nothing else."""
 
-    response = _get_judge().messages.create(
-        model=JUDGE_MODEL,
-        max_tokens=10,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    text = _qwen(prompt)
     try:
-        text = "".join(b.text for b in response.content if b.type == "text").strip()
-        return int(text[0])
+        for ch in text:
+            if ch in "12345":
+                return int(ch)
+        return 3
     except (ValueError, IndexError):
         return 3
 

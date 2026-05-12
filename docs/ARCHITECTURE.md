@@ -2,260 +2,526 @@
 
 End-to-end working of repomind — a grounded code-Q&A agent over a GitHub repository.
 
+---
+
 ## What it does
 
-Given a GitHub repo and a natural-language question, repomind finds the relevant code via a local semantic index, then asks an LLM to answer while *only* citing what it retrieved. Retrieval is mediated by tool calls inside a ReAct loop — the model decides what to fetch, when to search again, and when it has enough to answer.
+You give it a GitHub repo and a question. It finds the relevant code through a semantic index, then asks Qwen to answer using only what it retrieved. The model decides what to search, when to read a whole file, and when it has enough — nothing is hard-coded.
 
-## High-level diagram
+---
+
+## System overview
 
 ```
   ┌────────────────────────────────────────────────────────────────────┐
-  │                     Next.js Frontend (port 3000)                   │
+  │                   Next.js Frontend  (port 3000)                    │
   │                                                                    │
-  │  Sidebar                   /chat                  /benchmarks      │
-  │  • ingest trigger     • framer-motion msgs    • benchmark_results  │
-  │  • indexed repos      • per-col queue         • AST vs naive chart │
-  │  • drag-resize        • contextRef history                         │
-  └────┬───────────────────────┬──────────────────────────────────────┘
-       │ POST /api/ingest      │ POST /api/query  (+ history[])
-       │                       │ GET  /api/result/{event_id}  (poll)
-       ▼                       ▼
+  │   Sidebar                /chat                   /benchmarks       │
+  │   • owner/repo input     • animated messages     • AST vs naive    │
+  │   • AST / Naive toggle   • per-collection queue  • score chart     │
+  │   • drag-resize          • history context ref                     │
+  └────┬──────────────────────────┬───────────────────────────────────┘
+       │ POST /api/ingest         │ POST /api/query  (+history[])
+       │                          │ GET  /api/result/{event_id}  ← poll
+       ▼                          ▼
   ┌──────────────────────────────────────────────────────────────────┐
-  │                    server.py  (FastAPI, port 8000)               │
-  │                  + Inngest webhook at /api/inngest               │
+  │                  server.py  (FastAPI  port 8000)                 │
+  │                  Inngest webhook at /api/inngest                 │
   │                                                                  │
   │  repomind/ingest_repo          repomind/run_agent                │
-  │    step: fetch-and-chunk         step: compress-history          │
-  │    step: embed-and-store         step: query-rewrite             │
-  │                                  step: llm-generate-N            │
-  │  repomind/agent_completed        step: vector-search-N / tool-N  │
-  │    step: compute-metrics         step: check-anomalies           │
-  └────────────────────────┬─────────────────────────────────────────┘
-                           │ blocking I/O via asyncio.to_thread
-                           ▼
+  │    step 1: fetch-and-chunk       step 1: compress-history        │
+  │    step 2: embed-and-store       step 2: query-rewrite           │
+  │                                  step 3: llm-generate-N          │
+  │  repomind/agent_completed        step 4: vector-search-N / tool  │
+  │    step: compute-metrics                                         │
+  └───────────────────────────┬──────────────────────────────────────┘
+                              │  (all blocking I/O via asyncio.to_thread)
+                              ▼
   ┌──────────────────────────────────────────────────────────────────┐
-  │                         agent.py                                 │
-  │  query_rewrite(query, history_context) → compact search query    │
-  │  ReAct loop (text-based, up to max_steps=6):                     │
-  │    httpx.post(QWEN_GENERATE_URL) → parse Action / Action Input   │
-  │    run_tool(name, args, collection) → Observation                │
-  │    ... repeat until "Final Answer:" appears                      │
-  │  returns {answer, compressed_history, steps, usage}              │
-  └────────────────┬─────────────────────────────────────────────────┘
-                   │                      │
-        embed via openai SDK         raw file via PyGithub
-        (EMBED_BASE_URL/Modal)            │
-                   ▼                      ▼
-  ┌─────────────────────┐    ┌────────────────────────┐
-  │   ChromaDB          │    │   GitHub API           │
-  │   ./chroma_db/      │    │   (GITHUB_TOKEN)       │
-  │   <owner>_<repo>    │    └────────────────────────┘
-  │   _ast | _naive     │
-  └─────────────────────┘
+  │                        agent.py                                  │
+  │  1. query_rewrite(query, history) → compact search terms         │
+  │  2. ReAct loop (max 6 steps):                                    │
+  │       Qwen → parse "Action / Action Input" text                  │
+  │       run_tool(name, args) → Observation                         │
+  │       repeat until "Final Answer:" appears                       │
+  │  3. return {answer, compressed_history, steps}                   │
+  └──────────┬────────────────────────────┬───────────────────────────┘
+             │ embed query                │ fetch raw file
+             ▼ (Modal EMBED_BASE_URL)     ▼ (PyGithub)
+  ┌──────────────────────┐   ┌────────────────────────┐
+  │  ChromaDB            │   │  GitHub API            │
+  │  ./chroma_db/        │   │  (GITHUB_TOKEN)        │
+  │  owner_repo_ast      │   └────────────────────────┘
+  │  owner_repo_naive    │
+  └──────────────────────┘
 
   Side channels:
-    logger.py  → agent_logs.jsonl → eval/metrics.py → /logs page
-    tools.py   → _TOOL_METRICS (ContextVar) → embed_ms / chroma_ms in logs
-    eval/compare.py → LLM-as-judge (Claude) → benchmark_results.json → /benchmarks
-    Inngest Dev UI (localhost:8288) ← all job/event step traces
+    logger.py       → agent_logs.jsonl  → eval/metrics.py → /logs page
+    _TOOL_METRICS   → embed_ms / chroma_ms per call (ContextVar, thread-safe)
+    eval/compare.py → Qwen-as-judge     → benchmark_results.json → /benchmarks
+    Inngest Dev UI  → localhost:8288    ← every step trace, retry, event log
 ```
+
+---
 
 ## Components
 
-| Module | Role |
+| File | What it does |
 |---|---|
-| `inngest_setup.py` | Shared Inngest client singleton (`app_id="repomind"`, dev mode). Imported by `server.py` and `agent.py`. |
-| `server.py` | FastAPI app with Inngest webhook at `/api/inngest`. Three Inngest functions: `ingest_repo`, `run_agent`, `agent_completed`. REST: `POST /api/ingest`, `POST /api/query`, `GET /api/result/{id}`. All step handlers are `async def` with `asyncio.to_thread` for blocking I/O. |
-| `ingest.py` | Fetch a repo via PyGithub, chunk (AST for `.py`, H2 sections for `.md`, sliding-window otherwise), embed via Modal `BAAI/bge-small-en-v1.5`, upsert into ChromaDB. Exposes `fetch_and_chunk_repo` and `embed_and_store_chunks` for Inngest; `main()` for CLI. |
-| `agent.py` | Text-based ReAct orchestrator. `httpx.post(QWEN_GENERATE_URL)` → parse `Action:` / `Action Input:` → `run_tool` → `Observation:` → repeat. Accepts `history_block` for conversation context. Fires `repomind/agent_completed` event after every run (daemon thread). |
-| `tools.py` | `vector_search` (Modal embed → Chroma), `get_file` (PyGithub raw), `get_recent_commits`. `TOOL_SCHEMAS` used for prompt descriptions only (not API function-calling). Tracks `embed_ms`/`chroma_ms` via `_TOOL_METRICS` ContextVar. |
-| `prompts.py` | `REACT_PROMPT_TEMPLATE` (`{question}`, `{rewritten}`, `{scratchpad}`, `{history_block}`), `QUERY_REWRITE_PROMPT` (`{query}`, `{history_context}`), `COMPRESS_HISTORY_PROMPT` for lazy history compression. |
-| `logger.py` | Appends one JSON line per event to `agent_logs.jsonl`. Readers: `get_recent_logs`, `get_session_logs`. |
-| `frontend/app/layout.tsx` | Root layout: `Sidebar` + Plus Jakarta Sans font via `next/font/google`. |
-| `frontend/app/chat/page.tsx` | Animated chat UI. Per-collection queue (`inFlightRef` + `queuesRef`): same collection queues, different collections run in parallel. `contextRef` holds compressed history per collection. Framer-motion message animations, glass-morphism input card, mouse-follow gradient. |
-| `frontend/components/Sidebar.tsx` | Resizable sidebar (160–400 px via drag handle). Lucide icon nav (Chat/Logs/Benchmarks). Ingest form with AST/naive mode toggle. Indexed repos list with selection. |
-| `frontend/components/ui/animated-ai-chat.tsx` | `AnimatedTextarea` (auto-resize, violet focus ring), `TypingDots` (staggered 3-dot animation), `useAutoResizeTextarea` hook. |
-| `frontend/lib/api.ts` | `triggerQuery(query, collection, history[])`, `pollResult(eventId)`, `fetchCollections()`, `ingestRepo(repo, mode)`. Defines `ContextMessage` and `AgentResult` types. |
-| `eval/compare.py` | AST vs naive benchmark. Modal embeddings for retrieval, Claude (`claude-opus-4-7`) as judge, scores chunks 1–5. Writes `frontend/public/benchmark_results.json`. |
-| `eval/metrics.py` | Reads `agent_logs.jsonl`, computes per-session + aggregate latency/token/cost stats. |
-| `eval/test_queries.py` | Correctness harness — 5 fixed queries, must-contain/must-not-contain keyword scoring. |
+| `ingest.py` | Fetches repo via PyGithub, chunks every file (AST / heading / naive), embeds via Modal, upserts into ChromaDB. |
+| `agent.py` | Text-based ReAct loop. Calls Qwen with `httpx`, parses `Action:` / `Action Input:` text, dispatches tools, loops until `Final Answer:`. |
+| `tools.py` | Three tools: `vector_search` (embed → Chroma), `get_file` (raw GitHub), `get_recent_commits`. Formats results as plain text for the LLM. |
+| `prompts.py` | `REACT_PROMPT_TEMPLATE`, `QUERY_REWRITE_PROMPT`, `COMPRESS_HISTORY_PROMPT`. |
+| `server.py` | FastAPI + Inngest. Hosts `ingest_repo`, `run_agent`, `agent_completed` functions. All step handlers are `async def` + `asyncio.to_thread`. |
+| `logger.py` | Appends one JSON line per event to `agent_logs.jsonl`. |
+| `inngest_setup.py` | Shared Inngest client singleton. |
+| `frontend/app/chat/page.tsx` | Chat UI. Per-collection queue. `contextRef` for compressed history. Framer-motion animations. |
+| `frontend/components/Sidebar.tsx` | Resizable sidebar (160–400 px). Ingest form, AST/naive toggle, indexed repos list. |
+| `frontend/lib/api.ts` | `triggerQuery`, `pollResult`, `fetchCollections`, `ingestRepo`. |
+| `eval/compare.py` | AST vs naive benchmark. Retrieves top-3 chunks per query, asks Qwen to score 1–5. Writes `frontend/public/benchmark_results.json`. |
+| `eval/metrics.py` | Reads `agent_logs.jsonl`, computes latency / token / cost stats. |
 
-## Workflow 1 — Ingestion
+---
 
-### Via frontend sidebar (recommended — Inngest-monitored)
+## Workflow 1 — Ingestion (ingest a repo)
 
-1. User enters `owner/repo`, selects `AST` or `Naive`, clicks "Ingest Repo".
-2. Frontend POSTs to `POST /api/ingest` → `server.py` sends `repomind/ingest_repo` event.
-3. Inngest runs two steps (visible at localhost:8288):
+```
+User clicks "Ingest Repo"
+        │
+        ▼
+POST /api/ingest  →  server.py fires repomind/ingest_repo event to Inngest
+        │
+        ├── Step 1: fetch-and-chunk  (ingest.fetch_and_chunk_repo)
+        │     • PyGithub walks the repo tree
+        │     • skips: node_modules / .git / dist / build / files > 500 KB
+        │     • for every allowed file (.py .md .ts .tsx .js .jsx .txt):
+        │         .py  + ast mode  →  AST chunking   (see below)
+        │         .md              →  heading chunks
+        │         anything else    →  naive sliding window
+        │     • writes all chunks to a temp JSONL:
+        │         ./chroma_db/.chunks_<collection>_<event_id>.jsonl
+        │
+        └── Step 2: embed-and-store  (ingest.embed_and_store_chunks)
+              • reads the temp JSONL line by line
+              • embeds each chunk via openai SDK → Modal BAAI/bge-small-en-v1.5
+              • upserts into ChromaDB collection  owner_repo_ast  or  owner_repo_naive
+              • deletes the temp file in a finally block
+```
 
-**Step 1 — `fetch-and-chunk`** (`ingest.fetch_and_chunk_repo`):
-- Load `GITHUB_TOKEN`, resolve repo via PyGithub.
-- Walk the tree, skip `node_modules` / `.git` / `dist` / `build` and files over 500 KB.
-- For each allowed file (`.py`, `.md`, `.ts`, `.tsx`, `.js`, `.jsx`, `.txt`):
-  - `.py` + `ast` mode → parse with `ast.walk`, one chunk per function/class.
-  - `.md` → split at `## ` H2 headings.
-  - Anything else → naive fixed-size window (2000 chars, 50 overlap).
-- Write chunks to `./chroma_db/.chunks_<collection>_<event_id>.jsonl`. The `event_id` makes the file idempotent across Inngest retries.
-
-**Step 2 — `embed-and-store`** (`ingest.embed_and_store_chunks`):
-- Read the temp JSONL chunk-by-chunk.
-- Embed each chunk via `openai.OpenAI(base_url=EMBED_BASE_URL)` — Modal `BAAI/bge-small-en-v1.5`.
-- Upsert into Chroma collection `<owner>_<repo>_<mode>` with metadata: `type`, `name`, `file_path`, `line_start`, `line_end`, `language`, `heading`.
-- Delete the temp file in a `finally` block.
-
-**Result:** persistent Chroma collection at `./chroma_db`. Frontend returns immediately; watch progress in Inngest Dev UI.
-
-### Via CLI
-
+**CLI shortcut** (no Inngest, same logic):
 ```bash
 python ingest.py <owner>/<repo> <ast|naive>
 ```
 
-Calls both functions sequentially. Same logic, no Inngest visibility.
+---
 
-## Workflow 2 — Query
+## How chunking works
 
-1. **Submit.** Frontend posts `{query, collection_name, history: ContextMessage[]}` to `POST /api/query`. Server enqueues `repomind/run_agent` Inngest event and returns `{event_id}`. Frontend polls `GET /api/result/{event_id}` every second.
+Every file is split into **chunks** — short text pieces that get embedded and stored in ChromaDB. The chunk boundaries determine retrieval quality. repomind uses three strategies chosen automatically by file type and mode.
 
-2. **Compress history (Inngest step).** If total history chars > 12 K, summarize messages older than the last 4 pairs using Claude (`COMPRESS_HISTORY_PROMPT`). Always returns `effective_history` regardless of compression.
+---
 
-3. **Query rewrite (Inngest step).** `agent.query_rewrite(user_query, history_context)` → compact semantic search query.
+### Strategy 1 — AST chunking  (`.py` files in `ast` mode)
 
-4. **ReAct loop steps.** Each `llm-generate-N` and `vector-search-N` is a separate Inngest step visible in Dev UI.
+#### What is an AST?
 
-5. **Return.** Result dict includes `{answer, compressed_history, steps, usage}`. Frontend stores `compressed_history` in `contextRef[collection]` for the next turn.
+When Python loads a source file it first builds an **Abstract Syntax Tree** — a structured tree where every node is a named language construct: module, class, function, import, assignment, etc. Instead of blindly cutting at character counts, repomind walks this tree and uses the boundaries it already knows: where each function starts and ends, what its name is, and what its docstring says.
+
+#### Step-by-step (current implementation)
+
+```
+source code string
+       │
+       ▼
+Step 1 — parse
+  ast.parse(source)
+  → builds the full syntax tree
+  → if SyntaxError: return [] and fall back to naive chunking
+
+       │
+       ▼
+Step 2 — top-level scan  (ast.iter_child_nodes(tree))
+  Only direct children of the module are visited here — NOT a deep flat walk.
+  This prevents methods from appearing both inside the class chunk AND on their own.
+
+       │
+       ├─ FunctionDef / AsyncFunctionDef  ──────────────────────────┐
+       │                                                             │
+       │    Step 3a — extract function text                         │
+       │      lines[node.lineno-1 : node.end_lineno]                │
+       │      ast.get_docstring(node)                               │
+       │                                                             │
+       │    Step 3b — size check                                    │
+       │      len(text) <= 2000 chars?                              │
+       │        YES → one Chunk                                     │
+       │        NO  → sub-chunk with 2000-char sliding window       │
+       │              each part gets chunk_id …::part0, ::part1 …  │
+       │                                                             ◄──┘
+       │
+       └─ ClassDef  ────────────────────────────────────────────────┐
+                                                                     │
+           Step 3c — class header chunk                             │
+             find first_method_lineno                               │
+             text = lines[class_start : first_method_lineno - 1]   │
+             (class signature + docstring + class vars only —       │
+              method bodies are NOT included here)                  │
+                                                                     │
+           Step 3d — method chunks                                  │
+             for each FunctionDef / AsyncFunctionDef                │
+             inside the class body:                                 │
+               → same as Step 3a / 3b above                        │
+                                                                    ◄┘
+```
+
+#### What a chunk looks like
+
+```
+Chunk(
+  chunk_id = "src/auth.py::function::login::14"
+  text     = "def login(self, user, password):\n
+                  \"\"\"Validate credentials and return a JWT.\"\"\"\n
+                  ...",
+  metadata = {
+    type       : "function",
+    name       : "login",
+    file_path  : "src/auth.py",
+    line_start : 14,
+    line_end   : 38,
+    docstring  : "Validate credentials and return a JWT.",
+    language   : "python",
+  }
+)
+```
+
+Sub-chunks of an oversized function add one extra field:
+```
+  chunk_id = "src/big.py::function::process::1::part2"
+  metadata = { ..., part: 2 }
+```
+
+#### Concrete example
+
+```python
+# src/auth.py
+
+class AuthService:                  ← class header chunk  (lines 1-7)
+    """Handles all auth flows."""
+    SECRET = "jwt-secret"
+
+    def login(self, user):          ← function chunk  (lines 9-14)
+        return generate_jwt(user)
+
+    def logout(self, user):         ← function chunk  (lines 16-19)
+        revoke_token(user)
+
+def hash_password(pw):              ← function chunk  (lines 22-25)
+    return bcrypt.hash(pw)
+```
+
+Produces **4 chunks**:
+
+| chunk_id | type | lines | contains |
+|---|---|---|---|
+| `src/auth.py::class::AuthService::1` | class | 1–7 | class signature + docstring + `SECRET` — **no method bodies** |
+| `src/auth.py::function::login::9` | function | 9–14 | full `login` method |
+| `src/auth.py::function::logout::16` | function | 16–19 | full `logout` method |
+| `src/auth.py::function::hash_password::22` | function | 22–25 | full top-level function |
+
+---
+
+### Strategy 2 — Heading-based chunking  (`.md` files)
+
+```
+README.md
+  │
+  ├─ text before first ##      →  preamble chunk  (if non-empty)
+  ├─ ## Installation\n…        →  chunk 0  { heading: "Installation" }
+  ├─ ## Usage\n…               →  chunk 1  { heading: "Usage" }
+  └─ ## API Reference\n…       →  chunk 2  { heading: "API Reference" }
+```
+
+No H2 headings → whole file is one chunk.
+
+---
+
+### Strategy 3 — Naive sliding-window  (all other files + `.py` in `naive` mode)
+
+```
+source  (example: 6 000 chars)
+  │
+  window  = 2 000 chars
+  overlap =    50 chars
+  step    = 1 950 chars
+  │
+  ├─ chars    0 – 2000   →  chunk 0
+  ├─ chars 1950 – 3950   →  chunk 1
+  └─ chars 3900 – 5900   →  chunk 2
+```
+
+The 50-char overlap prevents code at a boundary from being split across two chunks with no context on either side.
+
+---
+
+### AST vs Naive — side-by-side
+
+```
+file: src/auth.py  (120 lines, 3 functions + 1 class)
+
+── AST mode ─────────────────────────────────────────────────
+  chunk 1  →  class AuthService header  (signature + class vars)
+  chunk 2  →  def login(...)            complete, self-contained
+  chunk 3  →  def logout(...)           complete, self-contained
+  chunk 4  →  def hash_password(...)    complete, self-contained
+
+  Each chunk has: name, line_start, line_end, docstring in metadata.
+
+── Naive mode ───────────────────────────────────────────────
+  chunk 0  →  chars 0–2000    (may end mid-function)
+  chunk 1  →  chars 1950–3950 (may start in the middle of logout)
+  chunk 2  →  chars 3900–5900 (may contain fragments of two functions)
+
+  Each chunk has: chunk_index, language in metadata.  No name. No lines.
+```
+
+| | AST | Naive |
+|---|---|---|
+| Boundary | Language construct end | Fixed character count |
+| Chunk content | Always a complete unit (function / class header / method) | Can start or end anywhere mid-logic |
+| Metadata | `name`, `line_start`, `line_end`, `docstring` | `chunk_index` only |
+| LLM citation quality | Can cite `login()` at `src/auth.py:9-14` | Can only cite file name |
+| Works on | Python only (others fall back to naive) | Any text file |
+| Oversized nodes | Sub-chunked with `::part0`, `::part1` labels + docstring surfaced in result header | No difference — all chunks are fixed-size anyway |
+
+---
+
+## How AST metadata flows from chunk to query answer
+
+This is the full journey from storage to the LLM's final answer.
+
+```
+INGEST TIME
+───────────
+ingest.py  chunks src/auth.py
+  → Chunk { text: "def login...", metadata: { name:"login", line_start:9, ... } }
+  → embed(text) via Modal  →  384-dim vector
+  → ChromaDB.upsert(id, vector, document=text, metadata)
+
+
+QUERY TIME
+──────────
+User asks: "how does login work?"
+  │
+  ▼
+Step 1 — query rewrite  (agent.py → Qwen)
+  "how does login work?" → "login authentication JWT implementation"
+
+  │
+  ▼
+Step 2 — vector_search  (tools.py)
+  embed("login authentication JWT implementation") → query vector
+  ChromaDB.query(query_vector, n_results=5)
+  → returns docs + metadatas
+
+  │
+  ▼
+Step 3 — format result  (tools.py vector_search output)
+  "[1] function `login` in src/auth.py (lines 9-14)
+   def login(self, user, password):
+       ..."
+
+  If it were a sub-chunk (part > 0):
+  "[1] function `login` in src/auth.py (lines 9-14) [excerpt part 1]
+       Docstring: Validate credentials and return a JWT.
+   ..."
+
+  │
+  ▼
+Step 4 — Qwen reads the result in the ReAct loop
+  Prompt tells it:
+    • cite file paths and line numbers  ← only possible because of AST metadata
+    • if you see "[excerpt part N]", check the docstring; call get_file if needed
+    • filter_type="function" to narrow to functions only
+
+  │
+  ▼
+Step 5 — Final Answer
+  "The `login` function in `src/auth.py` (lines 9-14) validates credentials
+   and returns a JWT token. It calls `generate_jwt(user)` after..."
+```
+
+Without AST metadata the answer would be: *"In the file src/auth.py there is some authentication code"* — no line numbers, no function name, no ability to say *which* part of the file.
+
+---
+
+## Workflow 2 — Query (ask a question)
+
+```
+User types a question in /chat
+        │
+        ▼
+POST /api/query  { query, collection_name, history[] }
+  → server.py enqueues repomind/run_agent, returns { event_id }
+  → frontend polls GET /api/result/{event_id} every second
+
+        │ Inngest runs:
+        │
+        ├── Step 1: compress-history
+        │     total chars of history > 12 000?
+        │       YES → keep last 4 message pairs verbatim,
+        │             summarize the rest with Qwen (COMPRESS_HISTORY_PROMPT)
+        │       NO  → pass history through unchanged
+        │
+        ├── Step 2: query-rewrite
+        │     Qwen rewrites the question into compact search terms
+        │     uses history context to resolve "it" / "that" / "above"
+        │
+        └── Steps 3…N: ReAct loop
+              Qwen generates:
+                Thought: …
+                Action: vector_search
+                Action Input: {"query": "login JWT", "filter_type": "function"}
+              tools.py runs vector_search → returns formatted result
+              Qwen reads Observation, decides next action
+              … repeats until "Final Answer:" or max_steps (6) reached
+
+        │
+        ▼
+result cached in _RESULT_CACHE[event_id]
+frontend poll returns { answer, compressed_history, steps, session_id }
+frontend stores compressed_history in contextRef[collection] for next turn
+```
+
+---
 
 ## Workflow 3 — Evaluation
 
-- **Correctness** (`eval/test_queries.py`) — 5 predefined questions, keyword pass/fail. Writes `eval_results.jsonl`.
-- **AST vs naive** (`eval/compare.py`) — top-3 chunks from both collections for 8 benchmark queries, Claude as judge (1–5 score). Writes `frontend/public/benchmark_results.json`. Run: `python eval/compare.py <owner>/<repo>`.
-- **Aggregate metrics** (`eval/metrics.py`) — reads `agent_logs.jsonl`, avg/median/p95 latency, total tokens, estimated cost.
+| Script | What it does | Output |
+|---|---|---|
+| `eval/compare.py <owner>/<repo>` | Retrieves top-3 chunks from both `_ast` and `_naive` collections for 8 benchmark queries. Asks Qwen to score each chunk 1–5 for relevance. | `frontend/public/benchmark_results.json` |
+| `eval/metrics.py` | Reads `agent_logs.jsonl`, computes avg / median / p95 latency, total tokens, cost. | printed to stdout |
+| `eval/test_queries.py` | Runs 5 fixed queries through the agent, checks answers for must-contain / must-not-contain keywords. | `eval_results.jsonl` |
+
+---
 
 ## Data stores
 
-| File / directory | Written by | Read by | Gitignored |
+| Path | Written by | Read by | Gitignored |
 |---|---|---|---|
 | `./chroma_db/` | `ingest.embed_and_store_chunks` | `tools.vector_search`, `eval/compare.py` | ✅ |
-| `./chroma_db/.chunks_*.jsonl` | `ingest.fetch_and_chunk_repo` | `ingest.embed_and_store_chunks` | ✅ (temp, auto-deleted) |
+| `./chroma_db/.chunks_*.jsonl` | `ingest.fetch_and_chunk_repo` | `ingest.embed_and_store_chunks` | ✅ temp, auto-deleted |
 | `agent_logs.jsonl` | `logger.log_step` | `eval/metrics.py`, `/logs` page | ✅ |
 | `eval_results.jsonl` | `eval/test_queries.py` | `/benchmarks` page | ✅ |
 | `frontend/public/benchmark_results.json` | `eval/compare.py` | `/benchmarks` page | ✅ |
 | `.env` | user | all modules | ✅ |
 
-## Design choices
+---
 
-- **Text-based ReAct, not OpenAI function calling.** The Qwen endpoint is a raw text completion API — it doesn't support `tools=` in the request. The agent parses `Action:` / `Action Input:` from the model output manually.
+## Key design decisions
 
-- **Tool-call-mediated retrieval.** The model decides when to search, when to read a file, and when it has enough to answer — not a fixed "embed → retrieve → answer" pipeline.
+**Text-based ReAct, not OpenAI function calling.**
+Qwen is served as a raw text-completion endpoint — no `tools=` support. The agent parses `Action:` / `Action Input:` from the model's text output manually.
 
-- **Embeddings are Modal, not local.** All embedding calls go through `EMBED_BASE_URL` (rag-learning's Modal deployment). There is no Ollama dependency anywhere.
+**Tool-call-mediated retrieval.**
+The model decides when to search, when to read a file, and when it has enough. No fixed "embed → retrieve → answer" pipeline.
 
-- **Inngest for ingest + agent.** Both ingestion and agent runs go through Inngest for durable execution, retry, and step-level visibility in the Dev UI. All Inngest step handlers are `async def` with `asyncio.to_thread` wrapping blocking I/O.
+**Embeddings via Modal, not local.**
+All embedding calls go through `EMBED_BASE_URL` (rag-learning's Modal deployment, `BAAI/bge-small-en-v1.5`). No Ollama anywhere.
 
-- **`_TOOL_METRICS` ContextVar for sub-tool latency.** `embed_ms` and `chroma_ms` are tracked in `tools.py` using a `contextvars.ContextVar` — thread-safe and async-safe across concurrent sessions.
+**All Inngest steps are `async def` + `asyncio.to_thread`.**
+The Inngest Python SDK calls step handlers directly on the asyncio event loop. Any blocking I/O (httpx, chromadb) in a sync handler starves uvicorn's request handling. Every blocking call is wrapped with `asyncio.to_thread`.
 
-- **Collections versioned by chunking mode.** `<owner>_<repo>_ast` and `<owner>_<repo>_naive` coexist in ChromaDB — this is what makes the AST vs naive benchmark possible without re-ingesting.
+**Stateless backend, stateful frontend history.**
+The backend receives `history[]` per-request, optionally compresses it, and returns `compressed_history`. No server-side session state. `contextRef` in `chat/page.tsx` holds the compressed history between turns.
 
-- **Stateless backend, stateful frontend history.** Conversation context is managed in `contextRef` in `chat/page.tsx`. The backend receives history per-request, optionally compresses it, and returns `compressed_history`. No server-side session state.
-
-- **Per-collection frontend queue.** `inFlightRef` + `queuesRef` in the chat page ensure that queries against the same collection run sequentially (later queries queue), while queries against different collections run in parallel.
+**Collections versioned by chunking mode.**
+`owner_repo_ast` and `owner_repo_naive` live side by side in ChromaDB — this is what makes the benchmark possible without re-ingesting.
 
 ---
 
 ## Challenges & lessons learned
 
-Ordered by depth of insight — the harder the root cause, the higher it appears.
+Ordered by depth of insight.
 
 ### 1. Inngest sync handlers block the asyncio event loop
 
-**Problem:** After migrating the agent to Inngest steps, the frontend's polling (`GET /api/result/{id}`) would return 500 errors even though the Inngest Dev UI showed the function completing successfully. The result cache was being written, but the poll endpoint wasn't reading it.
+**Problem:** The frontend poll returned 500 even though Inngest Dev UI showed the function completing.
 
-**Root cause:** The Inngest Python SDK's `step_async.py` calls step handler callables via `maybe_await(handler(*args))` — directly on the event loop, with no thread pool. A sync handler that blocks (e.g., `httpx.post`, `chromadb.query`) holds the event loop thread for the duration of that call, starving uvicorn's request handler. By the time the step finished and the result was cached, FastAPI was already returning a timeout to the frontend.
+**Root cause:** The Inngest Python SDK's `step_async.py` calls handlers via `maybe_await(handler(*args))` directly on the event loop. A blocking sync handler (httpx, chromadb) holds the thread, starving uvicorn.
 
-**Fix:** All Inngest step handlers converted to `async def`. Every blocking call wrapped with `asyncio.to_thread(blocking_fn, ...)`. This keeps the event loop free during I/O so uvicorn can serve the poll endpoint concurrently.
+**Fix:** All step handlers converted to `async def`. Every blocking call wrapped with `asyncio.to_thread(fn, ...)`.
 
-**Lesson:** With async frameworks, any sync I/O in an async context is a silent performance killer. Inngest's SDK doesn't warn you — it just blocks. Always wrap.
-
----
-
-### 2. Conversation history requires a stateless compression contract
-
-**Problem:** The agent is stateless per-request. To support multi-turn chat, the full conversation history must be passed with every query — but at 16 K+ chars, this pushes the model's context limit and inflates latency/cost.
-
-**Root cause:** Naive approaches either truncate (losing early context) or pass everything (ballooning the prompt). The challenge is deciding *what to keep* without losing the thread of the conversation.
-
-**Fix:** Lazy compression triggered at 75% of the char limit (12 K out of 16 K). When triggered: keep the last 4 message pairs verbatim (for immediate context coherence), summarize everything older with a single Claude call (`COMPRESS_HISTORY_PROMPT`). The backend returns `compressed_history` in every response; the frontend stores it in `contextRef[collection]` and sends it back next turn. Compression only fires when needed — most short conversations never trigger it.
-
-**Lesson:** "Keep recent + lazy summarize" is the right shape for this problem. The threshold and verbatim tail length are the tuning knobs; 12 K / 4 pairs worked well in practice.
+**Lesson:** Inngest doesn't warn you. Any sync I/O in an async handler is a silent blocker.
 
 ---
 
-### 3. Per-collection message queuing with parallel cross-collection support
+### 2. `ast.walk` caused method bodies to appear twice
 
-**Problem:** A user might send a second question before the first one finishes. Simply firing both requests in parallel against the same collection produces incoherent context — the second query doesn't have the first answer yet when it compresses history.
+**Problem:** The original AST implementation used `ast.walk(tree)` — a flat traversal that visits every node at every depth. A class with 3 methods produced 4 chunks, but each method's code appeared in *both* the class chunk (full class body) and the method's own chunk.
 
-**Root cause:** The chat page was sending every query immediately via `triggerQuery`, regardless of in-flight state.
+**Root cause:** `ast.walk` doesn't distinguish between top-level nodes and nested ones.
 
-**Fix:** `inFlightRef` (Set of active collection names) + `queuesRef` (Map of collection → pending query queue) in the chat page. When a query arrives for a collection that's already in-flight, it's appended to that collection's queue and executed only after the previous one settles. Queries against *different* collections are always independent and run in parallel. Queue drain is handled inside `executeQuery`'s `finally` block.
+**Fix:** Replaced with `ast.iter_child_nodes(tree)` for the top-level scan. For each `ClassDef`, the class chunk now contains only the class header (signature + docstring + class-level variables) — method bodies are stripped. Methods are extracted separately by iterating `ast.iter_child_nodes(class_node)`.
 
-**Lesson:** useRef (not useState) for the queue — React re-renders must not reset in-flight tracking mid-execution. Closures over stale state are the enemy here.
-
----
-
-### 4. AST vs naive benchmark used the wrong embedding backend
-
-**Problem:** `eval/compare.py` was using `ollama.embeddings()` — from an early prototype phase — while the rest of the project had long since migrated to Modal embeddings. Running the benchmark would silently produce meaningless retrieval results (different embedding space from what ChromaDB was indexed with).
-
-**Root cause:** The eval script was never updated when the embedding backend changed.
-
-**Fix:** Replaced `ollama.embeddings()` with `openai.OpenAI(base_url=EMBED_BASE_URL).embeddings.create(model=EMBED_MODEL, input=query)` — identical to the pattern in `tools.py`. Also moved the output path from `./benchmark_results.json` (project root, not served) to `frontend/public/benchmark_results.json` (served as a static asset to the Next.js `/benchmarks` page).
-
-**Lesson:** Eval scripts drift from production code. Any script that shares infrastructure (embedding models, vector DBs) with the main system needs to be updated as a first-class concern when that infrastructure changes.
+**Lesson:** Use `ast.iter_child_nodes` when you want one specific level of the tree. Use `ast.walk` only when you genuinely need every node at every depth.
 
 ---
 
-### 5. Sidebar resize required document-level event listeners, not element-level
+### 3. Oversized functions broke embedding quality
 
-**Problem:** Implementing a drag-to-resize sidebar using `onMouseMove` on the drag handle element itself: the cursor frequently escapes the thin (4 px) handle during fast drags, breaking the drag mid-gesture.
+**Problem:** A 400-line function became one 6 000-char chunk. Embedding models compress long text poorly — the vector loses specificity and retrieval quality drops.
 
-**Root cause:** `onMouseMove` on a small element only fires when the cursor is over that element. Fast mouse movement outpaces the element boundaries.
-
-**Fix:** `onMouseDown` on the drag handle sets `isDragging = true` and captures start position in refs. A `useEffect` on `isDragging` attaches `mousemove` and `mouseup` to `document` — these fire regardless of where the cursor is. On `mouseup`, `isDragging` is cleared and the listeners are removed. Width is clamped to [160, 400] px.
-
-**Lesson:** Drag gestures must be captured at the document level after `mousedown`. Element-level `mousemove` is only appropriate for hover effects.
+**Fix:** After extracting a function or method, if `len(text) > 2000`, apply the same sliding-window as naive chunking on the function text. Each part gets `::part0`, `::part1` etc. in the chunk ID. The `part` index is stored in metadata. When `vector_search` returns a sub-chunk it labels it `[excerpt part N]` and surfaces the docstring so the LLM can assess whether it needs the full file.
 
 ---
 
-### 6. Sidebar overflow required precise flex tree structure
+### 4. AST metadata was stored but never shown to the LLM
 
-**Problem:** The sidebar's "Indexed Repos" list wasn't scrollable — once more repos were added, the list overflowed outside the sidebar viewport with no scroll affordance.
+**Problem:** `name`, `line_start`, `line_end`, `docstring` were all stored in ChromaDB metadata but `vector_search` only returned the raw chunk text. The metadata existed but the LLM never saw it.
 
-**Root cause:** `overflow-y-auto` on a flex child has no effect unless the child has a bounded height. By default, flex children stretch to fill the flex axis — but without `min-h-0`, a flex child will refuse to shrink below its content's natural height. The browser treats content height as the minimum, so `overflow` never activates.
-
-**Fix:** The sidebar `<aside>` gets `h-full overflow-hidden`. The collections section gets `flex-1 min-h-0 overflow-y-auto`. `flex-1` lets it grow; `min-h-0` overrides the browser's implicit minimum; `overflow-y-auto` then has a bounded container to activate against.
-
-**Lesson:** `overflow-y: auto` on a flex child requires `min-height: 0` (or `min-h-0` in Tailwind). This is one of the most common "why isn't my scroll working" bugs in flex layouts.
-
----
-
-### 7. Lucide React does not export a Figma icon
-
-**Problem:** The `AnimatedAIChat` component referenced `Figma` from `lucide-react`, which does not exist in the package — causing a TypeScript compile error and breaking the entire `/chat` page.
-
-**Root cause:** The component was written for a version of Lucide or a different icon library that included a Figma brand icon. Brand icons are generally not included in Lucide due to trademark restrictions.
-
-**Fix:** Replaced `Figma` with `LayoutTemplate` — semantically close enough for a "design/layout" action in the command palette, and available in lucide-react.
-
-**Lesson:** Brand icons (Figma, Slack, GitHub, etc.) are rarely in general-purpose icon sets. Always verify icon names exist before using them, or use the library's icon search.
+**Fix:** `vector_search` now formats a header per result:
+```
+[1] function `login` in src/auth.py (lines 9-14)
+```
+Sub-chunks also show `[excerpt part N]` and the docstring. The ReAct prompt tells the agent to cite file:line and explains when to call `get_file` for the full body.
 
 ---
 
-### 8. AnimatedTextarea name collided with shadcn's Textarea
+### 5. Conversation history required a stateless compression contract
 
-**Problem:** Importing both the custom `Textarea` from `animated-ai-chat.tsx` and shadcn's `Textarea` from `components/ui/textarea.tsx` in the same file caused a TypeScript name collision and conflicting prop types.
+**Problem:** The backend is stateless per-request. Passing full history every turn causes context bloat at 16 K+ chars.
 
-**Root cause:** Both components were exported under the name `Textarea`.
+**Fix:** Lazy compression at 12 K chars (75% of limit). Keep last 4 message pairs verbatim; summarize older messages with one Qwen call. Backend returns `compressed_history` in every response. Frontend stores it in `contextRef[collection]` and sends it back next turn.
 
-**Fix:** Renamed the animated component to `AnimatedTextarea` throughout its file and all import sites. The shadcn `Textarea` retains its original name for backward compatibility with other pages.
+---
 
-**Lesson:** Custom component wrappers should always have distinct names from the primitives they wrap — "Animated", "Fancy", or semantic prefixes prevent silent shadowing in barrel imports.
+### 6. Benchmark used the wrong embedding backend
+
+**Problem:** `eval/compare.py` called `ollama.embeddings()` while the rest of the project had moved to Modal. Benchmark retrieval was in a completely different vector space from the indexed collections — results were meaningless.
+
+**Fix:** Replaced with `openai.OpenAI(base_url=EMBED_BASE_URL)` — identical to `tools.py`. Output path moved from project root to `frontend/public/benchmark_results.json` so the `/benchmarks` page can read it.
+
+---
+
+### 7. Per-collection message queuing
+
+**Problem:** Sending a second question before the first finishes produces incoherent compressed history.
+
+**Fix:** `inFlightRef` + `queuesRef` (useRef, not useState) in the chat page. Same-collection queries queue; different-collection queries run in parallel. Queue drains in `executeQuery`'s `finally` block.
+
+---
+
+### 8. Sidebar drag required document-level mouse listeners
+
+**Problem:** Fast mouse movement escaped the 4 px drag handle, breaking the gesture.
+
+**Fix:** `mousedown` on the handle sets `isDragging`; `useEffect` attaches `mousemove` and `mouseup` to `document` (not the element) for the duration of the drag.
+
+---
+
+### 9. Sidebar scroll required `min-h-0` on the flex child
+
+**Problem:** `overflow-y-auto` on the collections list had no effect.
+
+**Root cause:** Flex children won't shrink below their content height unless `min-height: 0` is set explicitly.
+
+**Fix:** Collections section gets `flex-1 min-h-0 overflow-y-auto`. Sidebar `<aside>` gets `h-full overflow-hidden`.

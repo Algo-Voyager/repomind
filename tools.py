@@ -115,12 +115,19 @@ def vector_search(
         line_start = meta.get("line_start")
         line_end = meta.get("line_end")
         heading = meta.get("heading")
+        part = meta.get("part")          # set only on sub-chunks of oversized nodes
+        docstring = meta.get("docstring", "")
 
         if kind in ("function", "class") and name and line_start and line_end:
+            part_note = f" [excerpt part {part}]" if part is not None else ""
             header = (
                 f"[{i}] {kind} `{name}` in {file_path} "
-                f"(lines {line_start}-{line_end})"
+                f"(lines {line_start}-{line_end}){part_note}"
             )
+            # Surface the docstring in the header so the LLM understands the
+            # function's purpose even when it receives a mid-body sub-chunk.
+            if docstring and part:
+                header += f"\n    Docstring: {docstring[:200]}"
         elif kind == "doc" and heading:
             header = f"[{i}] doc '{heading}' in {file_path}"
         else:
