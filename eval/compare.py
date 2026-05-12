@@ -141,11 +141,33 @@ Respond with ONLY a single digit 1-5. Nothing else."""
         return 3
 
 
-def run_benchmark(repo_owner: str, repo_name: str) -> dict:
+def _print_chunks(label: str, chunks: list[dict], scores: list[int]) -> None:
+    print(f"\n    ── {label} retrieved chunks ──")
+    for i, (c, s) in enumerate(zip(chunks, scores), 1):
+        meta = c["metadata"] or {}
+        kind      = meta.get("type", "chunk")
+        file_path = meta.get("file_path", "?")
+        name      = meta.get("name", "")
+        line_s    = meta.get("line_start", "")
+        line_e    = meta.get("line_end", "")
+        dist      = f"{c['distance']:.3f}"
+        loc = f"{file_path}:{line_s}-{line_e}" if line_s else file_path
+        header = f"[{i}] score={s}  dist={dist}  {kind}"
+        header += f" `{name}`" if name else ""
+        header += f"  @ {loc}"
+        print(f"    {header}")
+        # Show first 300 chars of the chunk text
+        preview = c["text"].replace("\n", " ").strip()[:300]
+        print(f"        {preview}")
+
+
+def run_benchmark(repo_owner: str, repo_name: str, verbose: bool = False) -> dict:
     ast_col   = f"{repo_owner}_{repo_name}_ast"
     naive_col = f"{repo_owner}_{repo_name}_naive"
 
     print(f"Comparing  {ast_col}  vs  {naive_col}")
+    if verbose:
+        print("  (verbose: showing retrieved chunks and scores)\n")
 
     results: list[dict] = []
     for query in BENCHMARK_QUERIES:
@@ -156,6 +178,10 @@ def run_benchmark(repo_owner: str, repo_name: str) -> dict:
 
         ast_scores   = [score_chunk(c["text"], query) for c in ast_chunks]
         naive_scores = [score_chunk(c["text"], query) for c in naive_chunks]
+
+        if verbose:
+            _print_chunks("AST",   ast_chunks,   ast_scores)
+            _print_chunks("Naive", naive_chunks, naive_scores)
 
         ast_avg   = round(mean(ast_scores),   2) if ast_scores   else 0.0
         naive_avg = round(mean(naive_scores), 2) if naive_scores else 0.0
@@ -208,8 +234,13 @@ def run_benchmark(repo_owner: str, repo_name: str) -> dict:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or "/" not in sys.argv[1]:
-        print("Usage: python eval/compare.py <owner>/<repo>", file=sys.stderr)
-        sys.exit(2)
-    owner, name = sys.argv[1].split("/", 1)
-    run_benchmark(owner, name)
+    import argparse
+    parser = argparse.ArgumentParser(description="AST vs naive chunking benchmark")
+    parser.add_argument("repo", help="owner/repo  e.g. Algo-Voyager/secure-lock-app")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print each retrieved chunk and its score")
+    args = parser.parse_args()
+    if "/" not in args.repo:
+        parser.error("repo must be in owner/repo format")
+    owner, name = args.repo.split("/", 1)
+    run_benchmark(owner, name, verbose=args.verbose)

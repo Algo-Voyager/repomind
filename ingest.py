@@ -32,19 +32,32 @@ from github.Repository import Repository
 
 
 SKIP_DIRS = {"node_modules", ".git", "dist", "build"}
-ALLOWED_EXTS = {".py", ".md", ".txt", ".js", ".ts", ".tsx", ".jsx"}
+ALLOWED_EXTS = {
+    ".py", ".md", ".txt",
+    ".js", ".ts", ".tsx", ".jsx",
+    ".dart",
+    ".go", ".rs", ".java", ".kt", ".swift", ".rb", ".cs",
+}
 MAX_FILE_BYTES = 500 * 1024
 CHUNK_CHARS = 2000
 CHUNK_OVERLAP = 50
 
 EXT_LANGUAGE = {
-    ".py": "python",
-    ".md": "markdown",
-    ".txt": "text",
-    ".js": "javascript",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".jsx": "javascript",
+    ".py":    "python",
+    ".md":    "markdown",
+    ".txt":   "text",
+    ".js":    "javascript",
+    ".ts":    "typescript",
+    ".tsx":   "typescript",
+    ".jsx":   "javascript",
+    ".dart":  "dart",
+    ".go":    "go",
+    ".rs":    "rust",
+    ".java":  "java",
+    ".kt":    "kotlin",
+    ".swift": "swift",
+    ".rb":    "ruby",
+    ".cs":    "csharp",
 }
 
 # Match an H2 heading only (## , but not ### or deeper).
