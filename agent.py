@@ -118,6 +118,11 @@ def run_agent(
 
         if "Final Answer:" in raw:
             answer = raw.split("Final Answer:", 1)[-1].strip()
+            _REACT_TOKENS = ("Thought:", "Action:", "Action Input:", "Observation:")
+            answer = "\n".join(
+                line for line in answer.splitlines()
+                if not any(line.strip().startswith(tok) for tok in _REACT_TOKENS)
+            ).strip()
             total_latency = round(time.time() - run_start, 2)
             log_step(session_id, step, "final_answer", {
                 "answer": answer,

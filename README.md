@@ -79,6 +79,18 @@ cd frontend && npm install && npm run dev
 
 **Ask questions** — select an indexed repo from the sidebar and type your question in the chat.
 
+The agent processes the query asynchronously — the UI shows a live "Agent working…" indicator while the ReAct loop runs tool calls in the background.
+
+![Agent processing a query in real time](assest/waiting_for_response.png)
+
+Once the loop completes, the answer streams in with file-path citations. Asking for a diagram or flowchart produces an interactive Mermaid chart you can click to zoom.
+
+![LLM response with codebase explanation](assest/llm_response.png)
+
+Every run is tracked as a durable job in Inngest — open `localhost:8288` to inspect each pipeline step and its timing.
+
+![Inngest Dev Server showing a full agent run with step-level timing](assest/inngest_info.png)
+
 **Run the benchmark** — after ingesting both `ast` and `naive` collections:
 
 ```bash
@@ -108,11 +120,12 @@ repomind/
 ├── tools.py               # vector_search, get_file, get_recent_commits
 ├── prompts.py             # ReAct, query-rewrite, history-compression prompts
 ├── logger.py              # Structured JSONL logging → agent_logs.jsonl
+├── assest/                # Screenshots used in this README
 ├── frontend/              # Next.js 14 UI
 │   ├── app/chat/          # Chat page
 │   ├── app/logs/          # Logs page
 │   ├── app/benchmarks/    # Benchmark results page
-│   ├── components/        # Sidebar, AnimatedTextarea, TypingDots
+│   ├── components/        # Sidebar, MarkdownRenderer, AnimatedTextarea
 │   └── lib/api.ts         # API client
 ├── eval/
 │   ├── compare.py         # AST vs naive benchmark (Qwen as judge)
@@ -120,8 +133,6 @@ repomind/
 │   └── metrics.py         # Latency / token / cost metrics
 ├── docs/
 │   └── ARCHITECTURE.md    # System design, chunking, pipeline, challenges
-├── deploy/
-│   └── qwen_modal.py      # Modal deployment config
 ├── requirements.txt
 ├── .env.example
 └── .gitignore

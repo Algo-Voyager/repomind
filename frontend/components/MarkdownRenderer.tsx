@@ -1,13 +1,19 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 import type { Components } from "react-markdown";
 
+const BTN =
+  "flex items-center justify-center rounded-md bg-muted border border-border text-foreground hover:bg-accent transition-colors text-sm select-none";
+
 function MermaidBlock({ code }: { code: string }) {
   const ref = useRef<HTMLDivElement>(null);
+  const [svgContent, setSvgContent] = useState("");
+  const [isOpen, setIsOpen] = useState(false);
+  const [zoom, setZoom] = useState(1);
 
   useEffect(() => {
     let cancelled = false;
@@ -18,34 +24,107 @@ function MermaidBlock({ code }: { code: string }) {
         startOnLoad: false,
         theme: "dark",
         themeVariables: {
-          background: "#0d1117",
-          primaryColor: "#1f6feb",
-          primaryTextColor: "#c9d1d9",
-          lineColor: "#8b949e",
-          edgeLabelBackground: "#161b22",
-          tertiaryColor: "#161b22",
+          background:           "#0d0d10",
+          primaryColor:         "#0c4a6e",
+          primaryBorderColor:   "#0ea5e9",
+          primaryTextColor:     "#f0f9ff",
+          lineColor:            "#38bdf8",
+          secondaryColor:       "#164e63",
+          tertiaryColor:        "#1e3a5f",
+          edgeLabelBackground:  "#0d0d10",
+          nodeTextColor:        "#f0f9ff",
+          clusterBkg:           "#111827",
+          titleColor:           "#bae6fd",
         },
       });
       const id = `mermaid-${Math.random().toString(36).slice(2)}`;
       mermaid
         .render(id, code)
         .then(({ svg }) => {
-          if (!cancelled && ref.current) ref.current.innerHTML = svg;
+          if (cancelled || !ref.current) return;
+          ref.current.innerHTML = svg;
+          const svgEl = ref.current.querySelector("svg");
+          if (svgEl) {
+            svgEl.removeAttribute("width");
+            svgEl.removeAttribute("height");
+            svgEl.style.width = "100%";
+            svgEl.style.height = "auto";
+            svgEl.style.maxWidth = "100%";
+          }
+          setSvgContent(ref.current.innerHTML);
         })
         .catch(() => {
           if (!cancelled && ref.current) {
-            ref.current.innerHTML = `<pre class="text-xs text-muted-foreground p-2">${code}</pre>`;
+            ref.current.innerHTML = `<pre class="text-xs text-muted-foreground p-2 whitespace-pre-wrap">${code}</pre>`;
           }
         });
     });
     return () => { cancelled = true; };
   }, [code]);
 
+  const open = () => { if (svgContent) { setZoom(1); setIsOpen(true); } };
+  const close = () => setIsOpen(false);
+  const zoomIn  = () => setZoom(z => Math.min(4, +(z * 1.25).toFixed(2)));
+  const zoomOut = () => setZoom(z => Math.max(0.25, +(z * 0.8).toFixed(2)));
+  const reset   = () => setZoom(1);
+
+  const handleWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    setZoom(z => Math.min(4, Math.max(0.25, z * (e.deltaY > 0 ? 0.85 : 1.18))));
+  };
+
   return (
-    <div
-      ref={ref}
-      className="my-3 flex justify-center rounded-md border border-border bg-muted p-4 overflow-x-auto"
-    />
+    <>
+      {/* Inline preview — click to open lightbox */}
+      <div className="relative group my-4">
+        <div
+          ref={ref}
+          className="w-full rounded-xl border border-border bg-[#0d0d10] p-6 overflow-x-auto cursor-zoom-in hover:border-sky-500/50 transition-colors"
+          onClick={open}
+        />
+        {svgContent && (
+          <span className="absolute top-2 right-2 text-[10px] text-muted-foreground bg-black/70 px-2 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+            Click to zoom
+          </span>
+        )}
+      </div>
+
+      {/* Lightbox */}
+      {isOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm"
+          onClick={close}
+        >
+          <div
+            className="relative flex flex-col rounded-xl border border-border bg-[#0d0d10]"
+            style={{ width: "90vw", height: "90vh" }}
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Toolbar */}
+            <div className="flex items-center justify-between px-4 py-2 border-b border-border shrink-0">
+              <span className="text-xs text-muted-foreground">Scroll to zoom · drag scrollbars to pan</span>
+              <div className="flex items-center gap-1.5">
+                <button onClick={zoomOut} className={`${BTN} w-8 h-8`} title="Zoom out">−</button>
+                <span className="text-xs text-muted-foreground w-12 text-center tabular-nums">
+                  {Math.round(zoom * 100)}%
+                </span>
+                <button onClick={zoomIn}  className={`${BTN} w-8 h-8`} title="Zoom in">+</button>
+                <button onClick={reset}   className={`${BTN} px-2 h-8 text-xs`} title="Reset zoom">Reset</button>
+                <button onClick={close}   className={`${BTN} w-8 h-8`} title="Close">✕</button>
+              </div>
+            </div>
+
+            {/* Scrollable diagram area */}
+            <div className="overflow-auto flex-1 p-6" onWheel={handleWheel}>
+              <div
+                style={{ width: `${zoom * 100}%`, minWidth: "100%", margin: "0 auto" }}
+                dangerouslySetInnerHTML={{ __html: svgContent }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

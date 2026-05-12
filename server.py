@@ -253,6 +253,11 @@ async def run_agent_fn(ctx: inngest.Context) -> dict:
 
         if "Final Answer:" in raw:
             answer = raw.split("Final Answer:", 1)[-1].strip()
+            _REACT_TOKENS = ("Thought:", "Action:", "Action Input:", "Observation:")
+            answer = "\n".join(
+                line for line in answer.splitlines()
+                if not any(line.strip().startswith(tok) for tok in _REACT_TOKENS)
+            ).strip()
             stop_reason = "final_answer"
             _ans, _sn = answer, step_num
             await ctx.step.run(
