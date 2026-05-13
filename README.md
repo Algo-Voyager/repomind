@@ -20,6 +20,8 @@ A developer documentation agent — point it at a GitHub repo and ask questions 
 
 No LangChain. No LlamaIndex.
 
+> AST-based chunking is validated by the [cAST (2025)](https://arxiv.org/abs/2506.15655) paper — *Enhancing Code RAG with Structural Chunking via Abstract Syntax Tree* — which reports +4.3 Recall@5 and +5.6 Pass@1 on Python repos over naive sliding-window chunking.
+
 ---
 
 ## Setup
