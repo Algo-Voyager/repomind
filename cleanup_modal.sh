@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODAL=$(command -v modal || echo ".venv/bin/modal")
-APP="repomind-vllm"
-VOLUMES=("huggingface-cache" "vllm-cache" "embed-cache")
+MODAL="$(command -v modal)"
+APP="qwen-7b-service"
+VOLUMES=("qwen-7b-weights-cache" "bge-small-embed-cache")
 
 echo "==> Stopping Modal app: $APP"
 $MODAL app stop "$APP" --yes
