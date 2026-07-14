@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Paperclip, SendIcon, LoaderIcon, Command, ArrowUpIcon } from "lucide-react";
+import { Paperclip, SendIcon, LoaderIcon, Command, ArrowUpIcon, Copy, Check } from "lucide-react";
 import { triggerQuery, pollResult, fetchSessionLogs, type AgentResult, type LogEntry, type ContextMessage } from "@/lib/api";
 import { ReasoningExpander } from "@/components/ReasoningExpander";
 import { MarkdownRenderer } from "@/components/MarkdownRenderer";
@@ -129,6 +129,17 @@ export default function ChatPage() {
   const messages: Message[] = collection ? (histories[collection] ?? []) : [];
   const isCurrentLoading = !!loadingCols[collection];
   const currentQueueCount = queueCounts[collection] ?? 0;
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+
+  async function handleCopy(i: number, content: string) {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopiedIndex(i);
+      setTimeout(() => setCopiedIndex((cur) => (cur === i ? null : cur)), 1500);
+    } catch (e) {
+      console.error("Failed to copy message", e);
+    }
+  }
 
   function appendMessage(col: string, msg: Message) {
     setHistories((prev) => ({ ...prev, [col]: [...(prev[col] ?? []), msg] }));
@@ -321,7 +332,7 @@ export default function ChatPage() {
               {messages.map((msg, i) => (
                 <motion.div
                   key={i}
-                  className={`flex gap-3 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+                  className={`group flex gap-3 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
                   initial={{ opacity: 0, y: 12 }}
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ duration: 0.25, ease: "easeOut" }}
@@ -357,6 +368,25 @@ export default function ChatPage() {
                         <div className="whitespace-pre-wrap">{msg.content}</div>
                       )}
                     </div>
+
+                    {msg.role === "assistant" &&
+                      msg.content !== "…" &&
+                      !(isCurrentLoading && i === messages.length - 1) && (
+                        <button
+                          onClick={() => handleCopy(i, msg.content)}
+                          className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground px-1.5 py-1 rounded-md hover:bg-accent/50"
+                          aria-label="Copy message"
+                        >
+                          {copiedIndex === i ? (
+                            <>
+                              <Check className="w-3.5 h-3.5" />
+                              <span>Copied</span>
+                            </>
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      )}
 
                     {msg.steps !== undefined && msg.logs !== undefined && (
                       <div className="w-full">
