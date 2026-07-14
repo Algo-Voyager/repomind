@@ -131,19 +131,6 @@ python eval/compare.py <owner>/<repo>     # results land in /benchmarks page
 
 ---
 
-## Production deployment
-
-See [`DEPLOY.md`](DEPLOY.md). Quick map:
-
-| Component | Host | Notes |
-|---|---|---|
-| Frontend | Vercel | Set `NEXT_PUBLIC_API_URL=https://<render>.onrender.com/api` |
-| Backend | Render | `render.yaml`; free tier wipes `chroma_db/` on every deploy |
-| Background jobs | Inngest Cloud | Sync via `curl -X PUT <render>/api/inngest` after deploy |
-| LLM + embeddings | Modal | Shared `qwen_modal.py` deployment |
-
-Extra prod env vars: `INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY`, `CORS_ORIGINS` (comma-separated whitelist), `CHROMA_DB_PATH` (if mounting persistent disk).
-
 ---
 
 ## Secrets and generated files
